@@ -1,0 +1,43 @@
+name: Validate CloudFormation templates
+
+# Validate every CloudFormation template in the repo on each push and PR.
+# Uses cfn-lint, which parses the templates and checks resource schemas,
+# intrinsic functions, and attribute placement without needing AWS credentials.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Lint CloudFormation templates
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Collect every YAML file that looks like a CloudFormation template
+          # (has the AWSTemplateFormatVersion or a Resources section).
+          mapfile -t templates < <(grep -rlE '^(AWSTemplateFormatVersion|Resources):' \
+            --include='*.yaml' --include='*.yml' . || true)
+
+          if [ ${#templates[@]} -eq 0 ]; then
+            echo "No CloudFormation templates found."
+            exit 0
+          fi
+
+          echo "Linting the following templates:"
+          printf '  %s\n' "${templates[@]}"
+          cfn-lint "${templates[@]}"
