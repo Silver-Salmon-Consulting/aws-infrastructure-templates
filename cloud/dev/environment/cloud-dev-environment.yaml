@@ -1,0 +1,713 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Shared CloudDev environment stack. Always creates an IAM role and instance
+  profile for AWS Systems Manager management, and optionally creates a VPC in
+  one of two topologies (public, or public-private with a single shared NAT
+  gateway) spread across a configurable number of Availability Zones.
+  Downstream CloudDev stacks import the exported outputs.
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General
+        Parameters:
+          - StackNamePrefix
+          - LogRetentionDays
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcMode
+          - AzCount
+          - VpcCidr
+          - AllowedCidr
+      - Label:
+          default: Server software defaults (fleet-wide, via SSM documents)
+        Parameters:
+          - DefaultNodeVersion
+          - DefaultPowerShellVersion
+    ParameterLabels:
+      StackNamePrefix:
+        default: Stack name prefix
+      LogRetentionDays:
+        default: Bootstrap log retention (days)
+      DefaultNodeVersion:
+        default: Default Node.js version
+      DefaultPowerShellVersion:
+        default: Default PowerShell version
+      VpcMode:
+        default: VPC topology
+      AzCount:
+        default: Availability Zone count
+      VpcCidr:
+        default: VPC CIDR block
+      AllowedCidr:
+        default: Allowed SSH CIDR
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  StackNamePrefix:
+    Type: String
+    Description: >-
+      Stack-name prefix that scopes which CloudFormation stacks the shared
+      dev-server role may signal (cloudformation:SignalResource). The role's
+      policy allows signaling stacks named "<prefix>*", so downstream dev
+      stacks created from this environment should use this prefix in their
+      stack names.
+    Default: CloudDev
+
+  LogRetentionDays:
+    Type: Number
+    Description: >-
+      How many days to retain the shared bootstrap (cloud-init) logs in
+      CloudWatch Logs before they expire.
+    Default: 7
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+
+  DefaultNodeVersion:
+    Type: String
+    Description: >-
+      Fleet-wide default Node.js major version. Baked into the Node config SSM
+      document as its NodeVersion parameter default, so every dev server that
+      applies the document installs this version. 24 is Active LTS, 22 is
+      Maintenance LTS, 26 is Current (as of October 2026).
+    Default: "24"
+    AllowedValues:
+      - "22"
+      - "24"
+      - "26"
+
+  DefaultPowerShellVersion:
+    Type: String
+    Description: >-
+      Fleet-wide default PowerShell version. Baked into the PowerShell config
+      SSM document as its PowerShellVersion parameter default, so every dev
+      server that applies the document installs this version. 7.6.6 is the
+      current LTS (as of October 2026).
+    Default: "7.6.6"
+
+  VpcMode:
+    Type: String
+    Description: >-
+      Networking topology to create. "none" creates no VPC (bring your own;
+      only the IAM role and instance profile are created). "public" creates a
+      VPC with an internet gateway and public subnet(s). "public-private" also
+      adds private subnet(s) with a single shared NAT gateway.
+    Default: none
+    AllowedValues:
+      - none
+      - public
+      - public-private
+
+  AzCount:
+    Type: Number
+    Description: >-
+      Number of Availability Zones to spread subnets across. Only relevant when
+      a VPC is created (VpcMode != none).
+    Default: 1
+    AllowedValues:
+      - 1
+      - 2
+      - 3
+
+  VpcCidr:
+    Type: String
+    Description: >-
+      CIDR block for the VPC. Must be large enough to carve eight /20 subnets
+      (a /16 is the intended default).
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR range, e.g. 10.0.0.0/16.
+
+  # Required parameter (intentionally no default): there is no safe default for
+  # an SSH ingress CIDR. It is only consulted when VpcMode != none, since the
+  # security group that uses it is created only then. When VpcMode is none you
+  # can pass any valid CIDR (e.g. your IP); it is ignored.
+  AllowedCidr:
+    Type: String
+    Description: >-
+      CIDR range allowed to reach the dev-server security group over SSH. Use
+      your public IP with /32 for a single address, e.g. 203.0.113.4/32. This
+      MUST be set when VpcMode != none; it is only used when a VPC is created.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR range, e.g. 203.0.113.4/32.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  CreateVpc: !Not [!Equals [!Ref VpcMode, none]]
+  CreatePrivate: !Equals [!Ref VpcMode, public-private]
+  TwoAzs: !Or [!Equals [!Ref AzCount, 2], !Equals [!Ref AzCount, 3]]
+  ThreeAzs: !Equals [!Ref AzCount, 3]
+  PublicAz2: !And [!Condition CreateVpc, !Condition TwoAzs]
+  PublicAz3: !And [!Condition CreateVpc, !Condition ThreeAzs]
+  PrivateAz2: !And [!Condition CreatePrivate, !Condition TwoAzs]
+  PrivateAz3: !And [!Condition CreatePrivate, !Condition ThreeAzs]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+  # CloudWatch Logs group that captures dev-server bootstrap output
+  # (/var/log/cloud-init-output.log) so provisioning can be debugged from the
+  # console even after a failed instance rolls back and terminates. Owned by
+  # the shared environment stack; downstream server stacks stream into it.
+  BootstrapLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/clouddev/${AWS::StackName}/bootstrap"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # IAM role that lets AWS Systems Manager manage dev instances (Session
+  # Manager, Run Command, Patch Manager, etc.). AmazonSSMManagedInstanceCore is
+  # the AWS-managed policy that grants the SSM agent the permissions it needs.
+  DevServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: SignalCreationStatus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow instances using this role to report provisioning status
+              # back to their CloudFormation stack. Scoped to stacks whose
+              # name starts with the configured prefix.
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackNamePrefix}*/*"
+        - PolicyName: WriteBootstrapLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow the CloudWatch agent to stream the bootstrap log into
+              # the shared log group (scoped to this group and its streams).
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt BootstrapLogGroup.Arn
+                  - !Sub "${BootstrapLogGroup.Arn}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ssm-role"
+
+  DevServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DevServerRole
+
+  # Managed, versioned SSM Command Document that installs Node.js/npm (via
+  # nvm, system-wide under /opt/nvm) and wires /etc/profile.d/nvm.sh. This
+  # replaces the Node install that used to live in the server stack's EC2
+  # UserData, so server configuration is maintained/updated/applied through
+  # SSM State Manager rather than baked into first-boot. Downstream server
+  # stacks apply it via an SSM Association (see the server template).
+  #
+  # Amazon Linux specific: uses dnf and the ec2-user account. The Ubuntu dev
+  # server will need its own document (apt, the ubuntu account).
+  AmazonLinuxServerConfigDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Content is authored WITHOUT Fn::Sub: the {{NodeVersion}}/{{NpmVersion}}
+      # tokens are SSM document parameters and MUST reach the deployed document
+      # literally. There are intentionally NO ${...} CloudFormation variables in
+      # this script.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install Node.js and npm (via nvm, system-wide under /opt/nvm) and
+          expose them to every login shell through /etc/profile.d/nvm.sh.
+        parameters:
+          NodeVersion:
+            type: String
+            description: Node.js major version to install via nvm.
+            # Fleet-wide default from the DefaultNodeVersion stack parameter.
+            # !Sub only touches ${...}; the {{NodeVersion}} placeholders in the
+            # runCommand below are left literal.
+            default: !Sub "${DefaultNodeVersion}"
+          NpmVersion:
+            type: String
+            description: npm version to install, or "latest" to keep the bundled one.
+            default: latest
+        mainSteps:
+          - action: aws:runShellScript
+            name: installNodeAndNpm
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                # SSM runs commands as root but does NOT set HOME; nvm needs it
+                # and under 'set -u' an unbound HOME aborts the script. Export it.
+                - export HOME=/root
+                - dnf install -y git tar gzip gcc-c++ make
+                - export NVM_DIR=/opt/nvm
+                - mkdir -p "$NVM_DIR"
+                - curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | NVM_DIR="$NVM_DIR" bash
+                - . "$NVM_DIR/nvm.sh"
+                - nvm install "{{NodeVersion}}"
+                - nvm alias default "{{NodeVersion}}"
+                - nvm use default
+                - if [ "{{NpmVersion}}" != "latest" ]; then npm install -g "npm@{{NpmVersion}}"; fi
+                - printf 'export NVM_DIR="/opt/nvm"\n[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\n' > /etc/profile.d/nvm.sh
+                - chmod +x /etc/profile.d/nvm.sh
+                - chown -R ec2-user:ec2-user /opt/nvm
+
+  # Managed, versioned SSM Command Document that installs PowerShell (pwsh) on
+  # Amazon Linux via Microsoft's per-architecture tarball, so it works on both
+  # x86_64 and arm64 instances (the script picks the right tarball from uname).
+  # Server stacks apply it via an SSM Association (see the server templates).
+  # Amazon Linux specific; Ubuntu would get its own document.
+  AmazonLinuxPowerShellDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{PowerShellVersion}} is an SSM document
+      # parameter and must reach the deployed document literally. There are
+      # intentionally NO ${...} CloudFormation variables in this script.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install PowerShell (pwsh) from Microsoft's per-architecture tarball
+          into /opt/microsoft/powershell/7 and symlink /usr/bin/pwsh. Works on
+          both x86_64 and arm64 Amazon Linux.
+        parameters:
+          PowerShellVersion:
+            type: String
+            description: PowerShell version to install (e.g. 7.6.6).
+            # Fleet-wide default from the DefaultPowerShellVersion stack
+            # parameter. !Sub only touches ${...}; the {{PowerShellVersion}}
+            # placeholder in the runCommand below is left literal.
+            default: !Sub "${DefaultPowerShellVersion}"
+        mainSteps:
+          - action: aws:runShellScript
+            name: installPowerShell
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - PS_VERSION="{{PowerShellVersion}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  PS_ARCH="x64" ;;
+                    aarch64) PS_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y tar gzip libicu
+                - INSTALL_DIR="/opt/microsoft/powershell/7"
+                - mkdir -p "$INSTALL_DIR"
+                - TARBALL="/tmp/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
+                - URL="https://github.com/PowerShell/PowerShell/releases/download/v$PS_VERSION/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
+                - curl -sSL "$URL" -o "$TARBALL"
+                - tar -xzf "$TARBALL" -C "$INSTALL_DIR"
+                - chmod +x "$INSTALL_DIR/pwsh"
+                - ln -sf "$INSTALL_DIR/pwsh" /usr/bin/pwsh
+                - rm -f "$TARBALL"
+                - /usr/bin/pwsh --version
+
+  # Tag-targeted SSM State Manager association that applies the Node config
+  # document to every dev server tagged CloudDevNodeConfig=enabled. Lives in
+  # this stack beside the document and references it with !Ref (NO
+  # Fn::ImportValue), so editing the document no longer hits a cross-stack
+  # export lock. No Parameters: the document's own NodeVersion/NpmVersion
+  # defaults (fleet-wide, from this stack's params) govern. Launch-only
+  # (no ScheduleExpression); applies when a matching instance registers with
+  # SSM. Decouple a server by removing its CloudDevNodeConfig tag.
+  NodeConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-node-config"
+      Name: !Ref AmazonLinuxServerConfigDocument
+      Targets:
+        - Key: "tag:CloudDevNodeConfig"
+          Values:
+            - enabled
+
+  # Tag-targeted association that applies the PowerShell document to every
+  # dev server tagged CloudDevPowerShellConfig=enabled. Same rationale as
+  # above: intra-stack !Ref, no Parameters (document default governs),
+  # launch-only. A server opts out by tagging the value anything other than
+  # "enabled" (the server stacks use "disabled" when EnablePowerShell=false).
+  PowerShellConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-powershell"
+      Name: !Ref AmazonLinuxPowerShellDocument
+      Targets:
+        - Key: "tag:CloudDevPowerShellConfig"
+          Values:
+            - enabled
+
+  # ---- VPC + public networking (created when VpcMode != none) ----
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !Select [0, !Cidr [!GetAtt Vpc.CidrBlock, 8, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: PublicAz2
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !Select [1, !Cidr [!GetAtt Vpc.CidrBlock, 8, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-2"
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: PublicAz3
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 2
+          - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !Select [2, !Cidr [!GetAtt Vpc.CidrBlock, 8, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-3"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: PublicAz2
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: PublicAz3
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      RouteTableId: !Ref PublicRouteTable
+
+  DevServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVpc
+    Properties:
+      GroupDescription: !Sub "SSH access for ${AWS::StackName} dev servers, restricted to a single CIDR."
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+          Description: SSH from the configured allowed CIDR.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic.
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # ---- Private networking + NAT (created when VpcMode == public-private) ----
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreatePrivate
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !Select [3, !Cidr [!GetAtt Vpc.CidrBlock, 8, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: PrivateAz2
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !Select [4, !Cidr [!GetAtt Vpc.CidrBlock, 8, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-2"
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: PrivateAz3
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 2
+          - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !Select [5, !Cidr [!GetAtt Vpc.CidrBlock, 8, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-3"
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreatePrivate
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreatePrivate
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreatePrivate
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreatePrivate
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreatePrivate
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: PrivateAz2
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: PrivateAz3
+    Properties:
+      SubnetId: !Ref PrivateSubnet3
+      RouteTableId: !Ref PrivateRouteTable
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  DevServerRoleArn:
+    Description: ARN of the shared SSM-managed IAM role.
+    Value: !GetAtt DevServerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DevServerRoleArn"
+
+  DevServerRoleName:
+    Description: Name of the shared SSM-managed IAM role.
+    Value: !Ref DevServerRole
+    Export:
+      Name: !Sub "${AWS::StackName}-DevServerRoleName"
+
+  DevServerInstanceProfileArn:
+    Description: ARN of the shared instance profile.
+    Value: !GetAtt DevServerInstanceProfile.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DevServerInstanceProfileArn"
+
+  DevServerInstanceProfileName:
+    Description: Name of the shared instance profile.
+    Value: !Ref DevServerInstanceProfile
+    Export:
+      Name: !Sub "${AWS::StackName}-DevServerInstanceProfileName"
+
+  BootstrapLogGroupName:
+    Description: Name of the shared bootstrap CloudWatch log group.
+    Value: !Ref BootstrapLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-BootstrapLogGroupName"
+
+  BootstrapLogGroupArn:
+    Description: ARN of the shared bootstrap CloudWatch log group.
+    Value: !GetAtt BootstrapLogGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BootstrapLogGroupArn"
+
+  AmazonLinuxServerConfigDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that configures Amazon Linux dev
+      servers (installs Node.js/npm via nvm). Amazon Linux specific (uses dnf
+      and the ec2-user account).
+    Value: !Ref AmazonLinuxServerConfigDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxServerConfigDocumentName"
+
+  AmazonLinuxPowerShellDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs PowerShell (pwsh)
+      on Amazon Linux dev servers (per-architecture tarball; x86_64 and arm64).
+    Value: !Ref AmazonLinuxPowerShellDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxPowerShellDocumentName"
+
+  VpcId:
+    Condition: CreateVpc
+    Description: ID of the created VPC.
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  PublicSubnet1Id:
+    Condition: CreateVpc
+    Description: ID of public subnet 1.
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet1Id"
+
+  PublicSubnet2Id:
+    Condition: PublicAz2
+    Description: ID of public subnet 2.
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet2Id"
+
+  PublicSubnet3Id:
+    Condition: PublicAz3
+    Description: ID of public subnet 3.
+    Value: !Ref PublicSubnet3
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet3Id"
+
+  PrivateSubnet1Id:
+    Condition: CreatePrivate
+    Description: ID of private subnet 1.
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet1Id"
+
+  PrivateSubnet2Id:
+    Condition: PrivateAz2
+    Description: ID of private subnet 2.
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet2Id"
+
+  PrivateSubnet3Id:
+    Condition: PrivateAz3
+    Description: ID of private subnet 3.
+    Value: !Ref PrivateSubnet3
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet3Id"
+
+  DevServerSecurityGroupId:
+    Condition: CreateVpc
+    Description: ID of the dev-server security group.
+    Value: !GetAtt DevServerSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-DevServerSecurityGroupId"

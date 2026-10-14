@@ -1,1 +1,196 @@
 # aws-infrastructure-templates
+
+Reusable, public AWS CloudFormation templates that are deployed manually. Each
+template is standalone YAML with no build step. They are validated in CI with
+[cfn-lint](https://github.com/aws-cloudformation/cfn-lint).
+
+## CloudDev remote development servers
+
+The first set of templates provisions remote development servers on EC2, split
+into a shared **environment** stack and one or more **server** stacks. Server
+configuration (Node.js, PowerShell) is delivered through managed, versioned AWS
+Systems Manager (SSM) documents applied by tag, rather than baked into instance
+boot scripts — so it is maintained centrally and re-appliable on demand.
+
+```
+cloud/dev/
+  environment/
+    cloud-dev-environment.yaml          # shared: IAM role, log group, SSM documents, VPC
+  server/
+    cloud-dev-server-amazon-linux.yaml      # x86_64 (AMD) dev server
+    cloud-dev-server-amazon-linux-arm.yaml  # arm64 (Graviton) dev server
+```
+
+### Architecture
+
+- **Environment stack** (`cloud-dev-environment.yaml`) — the shared foundation,
+  deployed once. It creates:
+  - an IAM role + instance profile with `AmazonSSMManagedInstanceCore` (so SSM
+    Session Manager, Run Command, and Patch Manager can manage the instances),
+    plus scoped inline policies that let the instances signal CloudFormation and
+    write bootstrap logs;
+  - a CloudWatch Logs group for instance bootstrap output;
+  - two SSM Command Documents — one installs Node.js/npm via nvm, the other
+    installs PowerShell (per-architecture tarball, works on x86_64 and arm64);
+  - two **tag-targeted** SSM State Manager associations that apply those
+    documents to any instance carrying the matching tag;
+  - an optional VPC (`public` or `public-private`, 1–3 AZs).
+- **Server stacks** (`cloud-dev-server-*.yaml`) — each launches one EC2 instance.
+  A server imports the IAM instance profile and log group from the environment
+  stack by name, and **tags itself** to opt into the shared SSM associations. It
+  does not define its own SSM documents or associations.
+
+The two server templates are identical except for CPU architecture:
+
+| Template | Arch | AMI | Instance types (default) |
+|---|---|---|---|
+| `cloud-dev-server-amazon-linux.yaml` | x86_64 (AMD) | AL2023 x86_64 | `t3a`/`m5a`/`c5a` (`t3a.medium`) |
+| `cloud-dev-server-amazon-linux-arm.yaml` | arm64 (Graviton) | AL2023 arm64 | `t4g`/`m6g`/`c6g` (`t4g.medium`) |
+
+### How server configuration is delivered (SSM, not UserData)
+
+Node.js and PowerShell are **not** installed by instance UserData. Instead:
+
+1. The environment stack owns the install logic as SSM Command Documents.
+2. The environment stack owns tag-targeted associations:
+   - `NodeConfigAssociation` targets `tag:CloudDevNodeConfig = enabled`
+   - `PowerShellConfigAssociation` targets `tag:CloudDevPowerShellConfig = enabled`
+3. Each server tags its instance to opt in:
+   - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
+   - `CloudDevPowerShellConfig = enabled` when `EnablePowerShell=true`, else
+     `disabled` (any value other than `enabled` simply does not match)
+
+Because the association lives beside the document in the environment stack and
+references it directly, server stacks have **no cross-stack dependency on the
+documents** — the documents can be edited freely without CloudFormation
+blocking the update. To decouple a server from fleet config, remove its tag.
+
+The instance's UserData does only the minimum: start the CloudWatch agent
+(best-effort) and signal CloudFormation that the instance booted. It installs no
+packages.
+
+### Fleet-wide software versions
+
+Node and PowerShell versions are set **once, on the environment stack**, and
+flow into the SSM documents' parameter defaults:
+
+- `DefaultNodeVersion` (default `24`) — Node.js major version (22 / 24 / 26)
+- `DefaultPowerShellVersion` (default `7.6.6`) — PowerShell version
+
+Server stacks do not take a Node/PowerShell version. Changing the fleet version
+means updating the environment stack and re-applying the association on existing
+servers (new servers pick it up automatically).
+
+## Deployment
+
+> **Stack naming matters.** The environment role only allows signaling
+> CloudFormation stacks whose name starts with `StackNamePrefix` (default
+> `CloudDev`). **Name every server stack with the `CloudDev` prefix** (e.g.
+> `CloudDev-AmzLinux-1`), or the instance's success signal is denied and the
+> stack hangs until it times out. ARN prefix matching is case-sensitive —
+> `cloud-dev-...` will NOT match `CloudDev*`.
+
+### 1. Deploy the environment stack
+
+```bash
+aws cloudformation deploy \
+  --template-file cloud/dev/environment/cloud-dev-environment.yaml \
+  --stack-name CloudDevEnv \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+      VpcMode=public \
+      AllowedCidr=<your.ip>/32
+```
+
+- `--capabilities CAPABILITY_IAM` is required (the stack creates IAM resources).
+- `AllowedCidr` is the SSH source for the dev-server security group (set it to
+  your public IP with `/32`). It is only consulted when a VPC is created.
+- Name it `CloudDevEnv` to match the server stacks' `EnvironmentStackName`
+  default.
+
+### 2. Deploy a server stack
+
+```bash
+aws cloudformation deploy \
+  --template-file cloud/dev/server/cloud-dev-server-amazon-linux.yaml \
+  --stack-name CloudDev-AmzLinux-1 \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+      EnvironmentStackName=CloudDevEnv \
+      AllowedCidr=<your.ip>/32 \
+      KeyPairName=<your-key-pair> \
+      VpcId=<vpc-id> \
+      SubnetId=<public-subnet-id>
+```
+
+Use the ARM template (`...-arm.yaml`) for a Graviton instance; it is otherwise
+identical.
+
+The instance reaches `CREATE_COMPLETE` once it boots and signals — **before**
+Node/PowerShell finish installing. Those install asynchronously via SSM State
+Manager after the instance registers; check their status in SSM association
+compliance (or just connect and run `node --version` / `pwsh --version`).
+
+## Connecting
+
+Connect via **Session Manager** — no SSH key or open port required, and it uses
+the attached SSM role:
+
+```bash
+aws ssm start-session --target <instance-id> --region <region>
+```
+
+The server stack's `SessionManagerCommand` output gives you this line directly.
+
+> Why not SSH / a public-IP output? The public IP is **ephemeral** — it changes
+> on every stop/start, which the idle auto-stop safeguard (below) triggers. SSH
+> still works from `AllowedCidr` if you fetch the current IP from the console,
+> but it is intentionally not a stack output. The default login user for Amazon
+> Linux is `ec2-user`.
+
+## Idle auto-stop safeguard
+
+Each server creates a CloudWatch alarm that **stops** (not terminates) the
+instance when it is idle, as a cost guard against a forgotten-running box:
+
+- `EnableIdleShutdown` (default `true`)
+- `IdleCpuThresholdPercent` (default `5`) — CPU % below which it is "idle"
+- `IdleStopPeriods` (default `12`) — consecutive 5-minute periods below the
+  threshold before stopping (12 × 5 min = 60 minutes)
+
+The alarm uses a 300-second period to match EC2 basic monitoring's 5-minute
+`CPUUtilization` resolution. The instance stops (EBS persists; restart it later).
+A truly idle box you are connected to will still stop after the window — raise
+`IdleStopPeriods` or set `EnableIdleShutdown=false` if that is a problem.
+
+## Environment stack parameters (summary)
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `StackNamePrefix` | `CloudDev` | Scopes which stacks the shared role may signal |
+| `LogRetentionDays` | `7` | Bootstrap log retention |
+| `DefaultNodeVersion` | `24` | Fleet-wide Node.js version |
+| `DefaultPowerShellVersion` | `7.6.6` | Fleet-wide PowerShell version |
+| `VpcMode` | `none` | `none` / `public` / `public-private` |
+| `AzCount` | `1` | Availability Zones (1–3) when a VPC is created |
+| `VpcCidr` | `10.0.0.0/16` | VPC CIDR when a VPC is created |
+| `AllowedCidr` | *(required)* | SSH source CIDR for the dev-server security group |
+
+## Validation
+
+All templates must pass cfn-lint with zero errors and warnings. CI
+(`.github/workflows/validate-templates.yml`) lints every template on push and
+pull request. To lint locally:
+
+```bash
+cfn-lint cloud/dev/**/*.yaml
+```
+
+## Roadmap / parked ideas
+
+- **Ubuntu dev server** — a sibling of the Amazon Linux server templates (apt,
+  the `ubuntu` login user) with its own SSM documents.
+- **Versioned, pinnable SSM documents** — version-named documents
+  (`DeletionPolicy: Retain`) with one tag-targeted association per version, so a
+  server can pin to a specific config version via its tag value while the fleet
+  default tracks the latest.

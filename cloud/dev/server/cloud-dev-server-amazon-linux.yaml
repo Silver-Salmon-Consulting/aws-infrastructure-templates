@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Remote development server. Provisions a single EC2 instance (Amazon Linux 2023)
+  with a security group that restricts SSH access to a single IP, and installs
+  Node.js / npm at the requested versions via nvm.
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Shared environment (from CloudDev environment stack)
+        Parameters:
+          - EnvironmentStackName
+      - Label:
+          default: Idle auto-stop safeguard
+        Parameters:
+          - EnableIdleShutdown
+          - IdleCpuThresholdPercent
+          - IdleStopPeriods
+      - Label:
+          default: Software (installed via shared SSM documents)
+        Parameters:
+          - EnablePowerShell
+    ParameterLabels:
+      EnvironmentStackName:
+        default: CloudDev environment stack name
+      EnableIdleShutdown:
+        default: Enable idle auto-stop
+      IdleCpuThresholdPercent:
+        default: Idle CPU threshold (%)
+      IdleStopPeriods:
+        default: Idle 5-min periods before stop
+      EnablePowerShell:
+        default: Install PowerShell
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentStackName:
+    Type: String
+    Description: >-
+      Name of the deployed CloudDev environment stack. The IAM instance
+      profile and bootstrap CloudWatch log group are imported from its exported
+      outputs (via Fn::ImportValue), so you only supply the stack name here.
+    Default: CloudDevEnv
+
+  AllowedCidr:
+    Type: String
+    Description: >-
+      CIDR range allowed to reach the dev server over SSH. Use your public IP
+      with /32 for a single address, e.g. 203.0.113.4/32.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR range, e.g. 203.0.113.4/32.
+
+  InstanceType:
+    Type: String
+    Description: >-
+      EC2 instance size for the dev server. These are AMD (x86_64) instance
+      families: t3a is burstable, m5a is general purpose, c5a is compute
+      optimized. All pair with the x86_64 AMI (the default LatestAmiId below).
+    Default: t3a.medium
+    AllowedValues:
+      - t3a.small
+      - t3a.medium
+      - t3a.large
+      - t3a.xlarge
+      - t3a.2xlarge
+      - m5a.large
+      - m5a.xlarge
+      - c5a.large
+      - c5a.xlarge
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair to enable SSH access.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in which to create the security group and dev server.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Public subnet (within the chosen VPC) to launch the instance into.
+      Must have a route to an internet gateway for SSH access and package
+      downloads.
+
+  VolumeSize:
+    Type: Number
+    Description: Root EBS volume size in GiB.
+    Default: 30
+    MinValue: 8
+    MaxValue: 1000
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: >-
+      SSM parameter that resolves to the latest Amazon Linux 2023 AMI.
+      Leave as the default unless you have a reason to change it.
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  EnableIdleShutdown:
+    Type: String
+    Description: >-
+      Create a CloudWatch alarm that STOPS (not terminates) the instance when
+      CPU stays below the idle threshold for the configured window. A cost
+      safeguard for a forgotten-running dev box.
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  IdleCpuThresholdPercent:
+    Type: Number
+    Description: >-
+      Average CPUUtilization (percent) below which the instance is considered
+      idle. Only used when EnableIdleShutdown is true.
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+
+  IdleStopPeriods:
+    Type: Number
+    Description: >-
+      Number of consecutive 5-minute periods CPU must stay below the idle
+      threshold before the instance is stopped. EC2 basic monitoring publishes
+      CPUUtilization every 5 minutes, so the alarm uses a 300-second period and
+      this is the number of those periods (e.g. 12 = 60 minutes). Only used
+      when EnableIdleShutdown is true.
+    Default: 12
+    MinValue: 1
+    MaxValue: 288
+
+  EnablePowerShell:
+    Type: String
+    Description: >-
+      Install PowerShell (pwsh) on the instance by applying the shared
+      PowerShell SSM document from the environment stack.
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  # PowerShellVersion is intentionally NOT a server-stack parameter. The
+  # fleet-wide PowerShell version is owned by the CloudDev environment stack
+  # (its DefaultPowerShellVersion param, baked into the PowerShell SSM
+  # document's default), so the association below passes no version and the
+  # document default governs.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
+  PowerShellEnabled: !Equals [!Ref EnablePowerShell, "true"]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+  DevServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "SSH access for ${AWS::StackName} dev server, restricted to a single IP."
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+          Description: SSH from the configured local IP.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic.
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  DevServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile:
+        Fn::ImportValue: !Sub "${EnvironmentStackName}-DevServerInstanceProfileName"
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt DevServerSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-dev-server"
+        # Opts this server into the environment stack's NodeConfigAssociation
+        # (installs Node/npm via the shared SSM document). Every dev server
+        # gets Node. Remove this tag to decouple from the association.
+        - Key: CloudDevNodeConfig
+          Value: enabled
+        # Opts into the environment stack's PowerShellConfigAssociation when
+        # EnablePowerShell=true. "disabled" simply does not match the
+        # association target, so pwsh is skipped without needing a
+        # conditional resource.
+        - Key: CloudDevPowerShellConfig
+          Value: !If [PowerShellEnabled, "enabled", "disabled"]
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+
+              # Signal CloudFormation using the AWS CLI (preinstalled on Amazon
+              # Linux 2023), rather than cfn-signal / aws-cfn-bootstrap which is not
+              # installed on AL2023 and is fragile to install via pip. The trap is
+              # set BEFORE any package install so that even a dnf failure reports a
+              # FAILURE signal instead of letting the stack wait out its timeout.
+              REGION="${AWS::Region}"
+              TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+                http://169.254.169.254/latest/meta-data/instance-id)
+
+              signal_cfn() {
+                local status="$1"
+                aws cloudformation signal-resource \
+                  --stack-name "${AWS::StackName}" \
+                  --logical-resource-id DevServerInstance \
+                  --unique-id "$INSTANCE_ID" \
+                  --status "$status" \
+                  --region "$REGION" || true
+              }
+              trap '[ $? -eq 0 ] && signal_cfn SUCCESS || signal_cfn FAILURE' EXIT
+
+              # NOTE: no package installs here. UserData only needs to start the
+              # CloudWatch agent and signal CloudFormation; it compiles nothing.
+              # Build tooling (git, gcc-c++, make) and Node are installed by the
+              # shared SSM document, applied via the tag-targeted association in
+              # the environment stack. The previous "dnf install gcc-c++ make"
+              # here pulled kernel-headers, which conflicts with the preinstalled
+              # kernel6.18-headers on current AL2023 and aborted the script.
+
+              # Best-effort CloudWatch agent so this bootstrap script's output
+              # (cloud-init-output.log) streams to CloudWatch Logs for easier
+              # debugging. This is a convenience, NOT a health dependency: the
+              # whole block runs in a subshell with '|| true' so a missing
+              # package or agent error can never fail the instance (and thus the
+              # stack). If it fails, logs are still on disk and in the EC2
+              # console output.
+              (
+                set -x
+                dnf install -y amazon-cloudwatch-agent
+                cat > /opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json <<'CWCONFIG'
+              {
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/var/log/cloud-init-output.log",
+                          "log_group_name": "${BootstrapLogGroupName}",
+                          "log_stream_name": "{instance_id}/cloud-init-output"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+              CWCONFIG
+                /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                  -a fetch-config -m ec2 -s \
+                  -c file:/opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json
+              ) || echo "WARNING: CloudWatch agent setup failed; continuing (logs still on disk / console)."
+
+              # cloud-init runs UserData as root but does NOT set HOME. Exported
+              # here harmlessly; Node.js/npm are now installed by the shared SSM
+              # Command Document (applied via the environment stack's
+              # tag-targeted NodeConfigAssociation), not by this UserData, so
+              # first-boot no longer waits on Node.
+              export HOME=/root
+
+              # Provisioning finished successfully; the EXIT trap above sends the
+              # success signal to CloudFormation. The CreationPolicy gates ONLY on
+              # instance boot/signal health here; Node/npm install success is tracked
+              # separately as SSM State Manager compliance.
+            - BootstrapLogGroupName:
+                Fn::ImportValue: !Sub "${EnvironmentStackName}-BootstrapLogGroupName"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+
+  # Cost safeguard: stop (not terminate) the instance when average CPU stays
+  # below IdleCpuThresholdPercent for IdleStopPeriods consecutive 5-minute
+  # periods. Uses the built-in EC2 'stop' alarm action (arn:aws:automate:
+  # ...:ec2:stop) — no Lambda, script, or IAM role required. Period is 300s to
+  # match EC2 basic monitoring's 5-minute CPUUtilization resolution (a shorter
+  # period would mostly see missing data and behave erratically). TreatMissing
+  # Data is notBreaching so a gap in metrics never triggers a stop. Created
+  # only when EnableIdleShutdown=true.
+  IdleShutdownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IdleShutdownEnabled
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-idle-shutdown"
+      AlarmDescription: !Sub >-
+        Stops ${AWS::StackName} when average CPU is below
+        ${IdleCpuThresholdPercent}% for ${IdleStopPeriods} consecutive 5-minute
+        periods.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DevServerInstance
+      Statistic: Average
+      # EC2 basic monitoring emits CPUUtilization every 5 minutes, so the
+      # period must be 300s; IdleStopPeriods is the count of those periods.
+      Period: 300
+      EvaluationPeriods: !Ref IdleStopPeriods
+      Threshold: !Ref IdleCpuThresholdPercent
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:stop"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  InstanceId:
+    Description: ID of the dev server EC2 instance.
+    Value: !Ref DevServerInstance
+
+  # No public IP / DNS / SSH outputs: the public IP is ephemeral (it changes on
+  # every stop/start, which the idle auto-stop alarm triggers), so outputting it
+  # would surface stale values and fail the stack when no public IP is assigned.
+  # Connect via Session Manager instead, which targets the stable instance ID,
+  # needs no open SSH port, and uses the attached SSM role.
+  SessionManagerCommand:
+    Description: >-
+      Connect to the dev server via AWS Systems Manager Session Manager
+      (no SSH key or open port required).
+    Value: !Sub "aws ssm start-session --target ${DevServerInstance} --region ${AWS::Region}"
