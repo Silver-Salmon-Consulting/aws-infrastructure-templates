@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Standalone SES setup for a single domain: verified domain identity (Easy DKIM)
+  plus an inbound receipt rule that writes every received email (raw MIME) to S3.
+  Not part of the dev/staging/prod CDK flow. Deploy in a region that supports
+  SES email receiving (e.g. us-east-1, us-west-2, eu-west-1).
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain to verify and receive mail for (e.g. example.com)
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 hosted zone ID for DomainName, in this account. If set, DKIM and MX
+      records are created automatically. Leave blank to create them yourself
+      (see stack Outputs).
+  KeyPrefix:
+    Type: String
+    Default: inbound/
+    Description: S3 key prefix for stored emails
+  RetentionDays:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Delete stored emails after this many days (0 = keep forever)
+  ActivateRuleSet:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Make this the account's active receipt rule set (only one can be active per
+      region). Set to false if the region already has an active rule set.
+  DmarcPolicy:
+    Type: String
+    Default: none
+    AllowedValues: ['', none, quarantine, reject]
+    Description: >
+      DMARC policy published at _dmarc.<DomainName> (requires HostedZoneId).
+      Start with "none" to monitor, then tighten. Blank = don't create the record
+      (e.g. the domain already has one).
+  DmarcReportEmail:
+    Type: String
+    Default: ''
+    Description: Optional address for DMARC aggregate reports (rua). Blank = no reports.
+
+Conditions:
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasRetention: !Not [!Equals [!Ref RetentionDays, 0]]
+  DoActivate: !Equals [!Ref ActivateRuleSet, 'true']
+  HasDmarcPolicy: !Not [!Equals [!Ref DmarcPolicy, '']]
+  CreateDmarc: !And [!Condition HasHostedZone, !Condition HasDmarcPolicy]
+  HasDmarcReports: !Not [!Equals [!Ref DmarcReportEmail, '']]
+
+Resources:
+  # ---------------------------------------------------------------- Identity
+  DomainIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimAttributes:
+        SigningEnabled: true
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+
+  DkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords: [!GetAtt DomainIdentity.DkimDNSTokenValue1]
+
+  DkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords: [!GetAtt DomainIdentity.DkimDNSTokenValue2]
+
+  DkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords: [!GetAtt DomainIdentity.DkimDNSTokenValue3]
+
+  InboundMxRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: MX
+      TTL: '300'
+      ResourceRecords:
+        - !Sub '10 inbound-smtp.${AWS::Region}.amazonaws.com'
+
+  # Easy DKIM signs as DomainName, so mail sent via SES passes DMARC on DKIM alignment.
+  DmarcRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDmarc
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '_dmarc.${DomainName}'
+      Type: TXT
+      TTL: '300'
+      ResourceRecords:
+        - !If
+          - HasDmarcReports
+          - !Sub '"v=DMARC1; p=${DmarcPolicy}; rua=mailto:${DmarcReportEmail}"'
+          - !Sub '"v=DMARC1; p=${DmarcPolicy}"'
+
+  # ------------------------------------------------------------------ Storage
+  InboundBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Expire
+            Status: !If [HasRetention, Enabled, Disabled]
+            Prefix: !Ref KeyPrefix
+            ExpirationInDays: !If [HasRetention, !Ref RetentionDays, 1]
+          - Id: ExpireRawStaging
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: 1
+
+  InboundBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSesPut
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${InboundBucket.Arn}/raw/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              StringLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${AWS::StackName}:receipt-rule/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt InboundBucket.Arn
+              - !Sub '${InboundBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------------------------------------------------------- Receiving
+  ReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Ref AWS::StackName
+
+  ReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: [InboundBucketPolicy, SorterPermission]
+    Properties:
+      RuleSetName: !Ref ReceiptRuleSet
+      Rule:
+        Name: store-inbound-to-s3
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: Optional
+        Recipients: [!Ref DomainName] # matches every address at this domain
+        Actions:
+          # 1. Stage the raw message at raw/<messageId>
+          - S3Action:
+              BucketName: !Ref InboundBucket
+              ObjectKeyPrefix: raw/
+          # 2. Then (actions run in order) sort it into <KeyPrefix><recipient>/<messageId>
+          - LambdaAction:
+              FunctionArn: !GetAtt SorterFunction.Arn
+              InvocationType: Event
+
+  SorterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: sort-inbound
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub '${InboundBucket.Arn}/raw/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${InboundBucket.Arn}/${KeyPrefix}*'
+
+  SorterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SorterRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref InboundBucket
+          KEY_PREFIX: !Ref KeyPrefix
+      Code:
+        ZipFile: |
+          import os, boto3
+          s3 = boto3.client("s3")
+          bucket = os.environ["BUCKET"]
+          prefix = os.environ["KEY_PREFIX"]
+          def handler(event, context):
+              for rec in event["Records"]:
+                  ses = rec["ses"]
+                  msg_id = ses["mail"]["messageId"]
+                  src = "raw/" + msg_id
+                  for r in ses["receipt"]["recipients"]:
+                      s3.copy_object(
+                          Bucket=bucket,
+                          CopySource={"Bucket": bucket, "Key": src},
+                          Key=f"{prefix}{r.lower()}/{msg_id}",
+                      )
+                  s3.delete_object(Bucket=bucket, Key=src)  # only after all copies succeed
+
+  SorterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SorterFunction
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${AWS::StackName}:receipt-rule/*'
+
+  # CloudFormation has no resource for "set active rule set", so a tiny
+  # custom resource does it (and deactivates on delete so the rule set can be removed).
+  ActivatorRole:
+    Type: AWS::IAM::Role
+    Condition: DoActivate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ses-active-rule-set
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ses:SetActiveReceiptRuleSet
+                Resource: '*'
+
+  ActivatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: DoActivate
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt ActivatorRole.Arn
+      Code:
+        ZipFile: |
+          # Responds to CloudFormation directly; the cfnresponse helper isn't
+          # reliably available in newer runtimes.
+          import json, urllib.request, boto3
+          ses = boto3.client("ses")
+          def send(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log stream {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or event["ResourceProperties"]["RuleSetName"],
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              urllib.request.urlopen(req, timeout=30)
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  if event["RequestType"] in ("Create", "Update"):
+                      ses.set_active_receipt_rule_set(RuleSetName=props["RuleSetName"])
+                  elif event["RequestType"] == "Delete":
+                      ses.set_active_receipt_rule_set()  # no name = deactivate
+                  send(event, context, "SUCCESS")
+              except Exception as e:
+                  print(e)
+                  send(event, context, "FAILED", str(e)[:500])
+
+  ActivateRuleSetResource:
+    Type: Custom::ActivateRuleSet
+    Condition: DoActivate
+    DependsOn: ReceiptRule
+    Properties:
+      ServiceToken: !GetAtt ActivatorFunction.Arn
+      ServiceTimeout: 300 # fail in 5 min instead of the default 1 hour if the function never responds
+      RuleSetName: !Ref ReceiptRuleSet
+
+Outputs:
+  BucketName:
+    Value: !Ref InboundBucket
+  InboundPrefix:
+    Description: Emails land at <this>/<recipient address>/<messageId>
+    Value: !Sub 's3://${InboundBucket}/${KeyPrefix}'
+  RuleSetName:
+    Value: !Ref ReceiptRuleSet
+  MxRecord:
+    Description: Create at the domain apex if HostedZoneId was not provided
+    Value: !Sub '10 inbound-smtp.${AWS::Region}.amazonaws.com'
+  DmarcRecord:
+    Condition: HasDmarcPolicy
+    Description: TXT at _dmarc.<DomainName>; create it yourself if HostedZoneId was not provided
+    Value: !If
+      - HasDmarcReports
+      - !Sub 'v=DMARC1; p=${DmarcPolicy}; rua=mailto:${DmarcReportEmail}'
+      - !Sub 'v=DMARC1; p=${DmarcPolicy}'
+  DkimCnameName1:
+    Value: !GetAtt DomainIdentity.DkimDNSTokenName1
+  DkimCnameValue1:
+    Value: !GetAtt DomainIdentity.DkimDNSTokenValue1
+  DkimCnameName2:
+    Value: !GetAtt DomainIdentity.DkimDNSTokenName2
+  DkimCnameValue2:
+    Value: !GetAtt DomainIdentity.DkimDNSTokenValue2
+  DkimCnameName3:
+    Value: !GetAtt DomainIdentity.DkimDNSTokenName3
+  DkimCnameValue3:
+    Value: !GetAtt DomainIdentity.DkimDNSTokenValue3
