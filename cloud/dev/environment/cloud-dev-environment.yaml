@@ -332,6 +332,55 @@ Resources:
                 - rm -f "$TARBALL"
                 - /usr/bin/pwsh --version
 
+  # Managed, versioned SSM Command Document that installs the OS-level shared
+  # libraries and fonts Playwright's Chromium needs to run headless on Amazon
+  # Linux. `npx playwright install-deps` only supports Debian/Ubuntu (apt), so
+  # the equivalent dnf packages are listed here. Browser binaries themselves
+  # are NOT installed: they are versioned per project, so run
+  # `npx playwright install chromium` in the project. Chromium is the
+  # supported engine on Amazon Linux; Playwright's WebKit/Firefox builds
+  # target Ubuntu. Works on x86_64 and arm64. Amazon Linux specific.
+  AmazonLinuxPlaywrightDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # No SSM parameters and NO ${...} CloudFormation variables.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install the system libraries and fonts Playwright's Chromium needs
+          to run headless on Amazon Linux (x86_64 and arm64), plus Xvfb for
+          headed runs. Does not download browser binaries.
+        mainSteps:
+          - action: aws:runShellScript
+            name: installPlaywrightDependencies
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                # Playwright needs Node (installed by the Node config
+                # document). SSM shells load no profile, so source nvm
+                # directly; fail fast if Node is not there yet.
+                - export HOME=/root
+                - '{ [ -s /opt/nvm/nvm.sh ] && . /opt/nvm/nvm.sh && command -v node; } || { echo "Node.js not found (apply the Node config document first)" >&2; exit 1; }'
+                # Shared libraries Chromium links against. Installed strictly
+                # so a missing package fails the association visibly.
+                - >-
+                  dnf install -y
+                  nss nspr atk at-spi2-atk at-spi2-core cups-libs dbus-libs
+                  expat glib2 libdrm libxkbcommon mesa-libgbm alsa-lib
+                  pango cairo libX11 libxcb libXcomposite libXcursor
+                  libXdamage libXext libXfixes libXi libXrandr libXtst
+                  libxshmfence xorg-x11-server-Xvfb
+                # Fonts are best-effort (strict=0 skips any package name this
+                # AL2023 release does not carry) so text renders in screenshots.
+                - >-
+                  dnf install -y --setopt=strict=0
+                  dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts
+                  liberation-fonts google-noto-sans-fonts
+                  google-noto-emoji-color-fonts
+                - fc-cache -f || true
+
   # Tag-targeted SSM State Manager association that applies the Node config
   # document to every dev server tagged CloudDevNodeConfig=enabled. Lives in
   # this stack beside the document and references it with !Ref (NO
@@ -362,6 +411,20 @@ Resources:
       Name: !Ref AmazonLinuxPowerShellDocument
       Targets:
         - Key: "tag:CloudDevPowerShellConfig"
+          Values:
+            - enabled
+
+  # Tag-targeted association that applies the Playwright dependencies
+  # document to every dev server tagged CloudDevPlaywrightConfig=enabled.
+  # Same pattern as the PowerShell association (the server stacks use
+  # "disabled" when EnablePlaywright=false).
+  PlaywrightConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-playwright"
+      Name: !Ref AmazonLinuxPlaywrightDocument
+      Targets:
+        - Key: "tag:CloudDevPlaywrightConfig"
           Values:
             - enabled
 
@@ -655,6 +718,14 @@ Outputs:
     Value: !Ref AmazonLinuxPowerShellDocument
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxPowerShellDocumentName"
+
+  AmazonLinuxPlaywrightDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs Playwright's
+      Chromium system dependencies on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxPlaywrightDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxPlaywrightDocumentName"
 
   VpcId:
     Condition: CreateVpc

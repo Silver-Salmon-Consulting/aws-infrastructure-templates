@@ -25,6 +25,7 @@ Metadata:
           default: Software (installed via shared SSM documents)
         Parameters:
           - EnablePowerShell
+          - EnablePlaywright
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
@@ -36,6 +37,8 @@ Metadata:
         default: Idle 5-min periods before stop
       EnablePowerShell:
         default: Install PowerShell
+      EnablePlaywright:
+        default: Install Playwright dependencies
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -146,6 +149,18 @@ Parameters:
       - "true"
       - "false"
 
+  EnablePlaywright:
+    Type: String
+    Description: >-
+      Install the system libraries and fonts Playwright's Chromium needs by
+      applying the shared Playwright SSM document from the environment stack.
+      Browser binaries are not installed; run `npx playwright install
+      chromium` in your project.
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
   # PowerShellVersion is intentionally NOT a server-stack parameter. The
   # fleet-wide PowerShell version is owned by the CloudDev environment stack
   # (its DefaultPowerShellVersion param, baked into the PowerShell SSM
@@ -158,6 +173,7 @@ Parameters:
 Conditions:
   IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
   PowerShellEnabled: !Equals [!Ref EnablePowerShell, "true"]
+  PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -214,6 +230,10 @@ Resources:
         # conditional resource.
         - Key: CloudDevPowerShellConfig
           Value: !If [PowerShellEnabled, "enabled", "disabled"]
+        # Opts into the environment stack's PlaywrightConfigAssociation when
+        # EnablePlaywright=true (same enabled/disabled pattern as above).
+        - Key: CloudDevPlaywrightConfig
+          Value: !If [PlaywrightEnabled, "enabled", "disabled"]
       UserData:
         Fn::Base64:
           Fn::Sub:
