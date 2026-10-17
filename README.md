@@ -183,8 +183,45 @@ All templates must pass cfn-lint with zero errors and warnings. CI
 pull request. To lint locally:
 
 ```bash
-cfn-lint cloud/dev/**/*.yaml
+cfn-lint cloud/dev/**/*.yaml ses/*.yaml redirect/*.yaml
 ```
+
+## Domain redirect
+
+`redirect/domain-redirect.yaml` redirects every request to a domain (and
+optionally `www.` of it) to a URL. It creates a DNS-validated ACM certificate,
+a CloudFront distribution whose viewer-request CloudFront Function returns the
+redirect at the edge, and A/AAAA alias records in the hosted zone. HTTP and
+HTTPS both redirect in a single hop.
+
+```bash
+aws cloudformation deploy \
+  --region us-east-1 \
+  --template-file redirect/domain-redirect.yaml \
+  --stack-name redirect-old-example-com \
+  --parameter-overrides \
+      DomainName=old-example.com \
+      HostedZoneId=<zone-id> \
+      RedirectUrl=https://www.example.com
+```
+
+- **Must be deployed in `us-east-1`**, because CloudFront only accepts ACM
+  certificates from there. A template rule enforces this.
+- The hosted zone must be in the same account, and must be authoritative for
+  the domain (ACM validation waits for it).
+- The domain must not already have A/AAAA records. Delete them first, or the
+  stack fails.
+- First deploys take roughly 5–15 minutes (certificate validation, then
+  distribution rollout).
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `DomainName` | *(required)* | Domain to redirect from |
+| `HostedZoneId` | *(required)* | Route 53 zone for `DomainName` |
+| `RedirectUrl` | *(required)* | Absolute `http(s)://` URL to redirect to |
+| `StatusCode` | `301` | `301` / `302` / `307` / `308`. Browsers cache 301/308, so use 302 while testing |
+| `PreservePath` | `false` | `true` appends the request path and query string (`/a?b=c` → `RedirectUrl/a?b=c`) |
+| `IncludeWww` | `false` | Also redirect `www.DomainName` |
 
 ## Roadmap / parked ideas
 

@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Standalone HTTP(S) redirect for a single domain: every request to DomainName
+  (optionally also www.DomainName) is redirected to RedirectUrl. Uses an ACM
+  certificate (DNS-validated in HostedZoneId), a CloudFront distribution and a
+  CloudFront Function that answers at the edge, so no origin is ever contacted.
+  Must be deployed in us-east-1 (CloudFront only accepts ACM certificates from
+  there).
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain to redirect from (e.g. old-example.com or go.example.com)
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: >
+      Route 53 hosted zone ID for DomainName, in this account. Used for ACM DNS
+      validation and the alias records pointing DomainName at CloudFront.
+  RedirectUrl:
+    Type: String
+    Description: >
+      Absolute URL to redirect to (e.g. https://www.example.com/landing). With
+      PreservePath=true, give just the scheme and host (e.g. https://example.com).
+    AllowedPattern: '^https?://[^\s/''"\\]+(/[^\s''"\\]*)?$'
+    ConstraintDescription: Must be an absolute http(s) URL with no quotes, backslashes or spaces
+  StatusCode:
+    Type: String
+    Default: '301'
+    AllowedValues: ['301', '302', '307', '308']
+    Description: >
+      HTTP redirect status. 301/308 are permanent (browsers cache them hard; use
+      302/307 while testing).
+  PreservePath:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Append the request's path and query string to RedirectUrl
+      (DomainName/a/b?c=d -> RedirectUrl/a/b?c=d). false = everything goes to
+      RedirectUrl exactly.
+  IncludeWww:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Also redirect www.DomainName (adds it to the certificate and DNS)
+
+Rules:
+  MustBeUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref AWS::Region, us-east-1]
+        AssertDescription: Deploy in us-east-1; CloudFront requires its ACM certificate there.
+
+Mappings:
+  StatusText:
+    '301': {Text: Moved Permanently}
+    '302': {Text: Found}
+    '307': {Text: Temporary Redirect}
+    '308': {Text: Permanent Redirect}
+
+Conditions:
+  WithWww: !Equals [!Ref IncludeWww, 'true']
+
+Resources:
+  # ------------------------------------------------------------- Certificate
+  # DNS validation records are created in HostedZoneId automatically.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames: !If [WithWww, [!Sub 'www.${DomainName}'], !Ref AWS::NoValue]
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+        - !If
+          - WithWww
+          - DomainName: !Sub 'www.${DomainName}'
+            HostedZoneId: !Ref HostedZoneId
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------- Redirect
+  # Runs on viewer request and returns the redirect itself, so the origin
+  # below is never reached. Avoids JS template literals: ${} is Fn::Sub syntax.
+  RedirectFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-redirect'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: !Sub 'Redirect ${DomainName} to ${RedirectUrl}'
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub
+        - |
+          var TARGET = '${RedirectUrl}';
+          var PRESERVE_PATH = ${PreservePath};
+          function handler(event) {
+              var location = TARGET;
+              if (PRESERVE_PATH) {
+                  var req = event.request;
+                  location = location.replace(/\/+$/, '') + req.uri;
+                  var parts = [];
+                  for (var key in req.querystring) {
+                      var q = req.querystring[key];
+                      var values = q.multiValue ? q.multiValue : [q];
+                      for (var i = 0; i < values.length; i++) {
+                          parts.push(values[i].value === '' ? key : key + '=' + values[i].value);
+                      }
+                  }
+                  if (parts.length) {
+                      location += (location.indexOf('?') === -1 ? '?' : '&') + parts.join('&');
+                  }
+              }
+              return {
+                  statusCode: ${StatusCode},
+                  statusDescription: '${Text}',
+                  headers: { location: { value: location } }
+              };
+          }
+        - Text: !FindInMap [StatusText, !Ref StatusCode, Text]
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Redirect ${DomainName} -> ${RedirectUrl}'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Aliases: !If
+          - WithWww
+          - [!Ref DomainName, !Sub 'www.${DomainName}']
+          - [!Ref DomainName]
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        # Placeholder origin (the redirect target's host). CloudFront requires
+        # one, but the function answers every request before it is used.
+        Origins:
+          - Id: placeholder
+            DomainName: !Select [2, !Split ['/', !Ref RedirectUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: placeholder
+          # allow-all: plain-HTTP requests go straight to RedirectUrl in one hop
+          ViewerProtocolPolicy: allow-all
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RedirectFunction.FunctionMetadata.FunctionARN
+
+  # --------------------------------------------------------------------- DNS
+  # Z2FDTNDATAQYW2 is the fixed hosted zone ID for all CloudFront aliases.
+  ApexRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  ApexRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: WithWww
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  WwwRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: WithWww
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${DomainName}'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+  CertificateArn:
+    Value: !Ref Certificate
+  RedirectsFrom:
+    Value: !If
+      - WithWww
+      - !Sub 'https://${DomainName}, https://www.${DomainName}'
+      - !Sub 'https://${DomainName}'
+  RedirectsTo:
+    Value: !Sub '${StatusCode} -> ${RedirectUrl}'
