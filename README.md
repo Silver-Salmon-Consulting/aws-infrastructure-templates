@@ -8,7 +8,8 @@ template is standalone YAML with no build step. They are validated in CI with
 
 The first set of templates provisions remote development servers on EC2, split
 into a shared **environment** stack and one or more **server** stacks. Server
-configuration (Node.js, PowerShell, Playwright dependencies) is delivered through managed, versioned AWS
+configuration (Node.js, PowerShell, Playwright dependencies, .NET SDKs) is
+delivered through managed, versioned AWS
 Systems Manager (SSM) documents applied by tag, rather than baked into instance
 boot scripts — so it is maintained centrally and re-appliable on demand.
 
@@ -30,10 +31,11 @@ cloud/dev/
     plus scoped inline policies that let the instances signal CloudFormation and
     write bootstrap logs;
   - a CloudWatch Logs group for instance bootstrap output;
-  - three SSM Command Documents — one installs Node.js/npm via nvm, one
+  - four SSM Command Documents — one installs Node.js/npm via nvm, one
     installs PowerShell (per-architecture tarball, works on x86_64 and arm64),
-    and one installs the system libraries/fonts Playwright's Chromium needs;
-  - three **tag-targeted** SSM State Manager associations that apply those
+    one installs the system libraries/fonts Playwright's Chromium needs, and
+    one installs a .NET SDK channel (`DotNetChannel` parameter);
+  - five **tag-targeted** SSM State Manager associations that apply those
     documents to any instance carrying the matching tag;
   - an optional VPC (`public` or `public-private`, 1–3 AZs).
 - **Server stacks** (`cloud-dev-server-*.yaml`) — each launches one EC2 instance.
@@ -57,12 +59,23 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `NodeConfigAssociation` targets `tag:CloudDevNodeConfig = enabled`
    - `PowerShellConfigAssociation` targets `tag:CloudDevPowerShellConfig = enabled`
    - `PlaywrightConfigAssociation` targets `tag:CloudDevPlaywrightConfig = enabled`
+   - `DotNet8ConfigAssociation` targets `tag:CloudDevDotNet8Config = enabled`
+     (passes `DotNetChannel=8.0`)
+   - `DotNet10ConfigAssociation` targets `tag:CloudDevDotNet10Config = enabled`
+     (passes `DotNetChannel=10.0`)
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
    - `CloudDevPowerShellConfig = enabled` when `EnablePowerShell=true`, else
      `disabled` (any value other than `enabled` simply does not match)
    - `CloudDevPlaywrightConfig = enabled` when `EnablePlaywright=true`
      (default `false`), else `disabled`
+   - `CloudDevDotNet8Config` / `CloudDevDotNet10Config = enabled` when
+     `EnableDotNet8` / `EnableDotNet10=true` (both default `false`)
+
+The .NET SDKs install side by side into `/opt/dotnet` (via Microsoft's
+`dotnet-install.sh`, x64 or arm64 automatically), with `/usr/bin/dotnet`
+symlinked and `DOTNET_ROOT` set in `/etc/profile.d/dotnet.sh`. Pin a project to
+a specific SDK with `global.json`; `dotnet --list-sdks` shows what is installed.
 
 The Playwright document installs only OS dependencies (the dnf equivalent of
 `npx playwright install-deps`, which supports apt only) plus Xvfb. Browser

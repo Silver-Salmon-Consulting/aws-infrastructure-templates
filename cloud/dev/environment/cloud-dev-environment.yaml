@@ -381,6 +381,51 @@ Resources:
                   google-noto-emoji-color-fonts
                 - fc-cache -f || true
 
+  # Managed, versioned SSM Command Document that installs a .NET SDK (build,
+  # run, test) side by side under /opt/dotnet using Microsoft's
+  # dotnet-install.sh, which picks the right x64/arm64 build automatically.
+  # One document serves every channel: the 8.0 and 10.0 associations below
+  # pass DotNetChannel. Amazon Linux specific (dnf for the native deps).
+  AmazonLinuxDotNetSdkDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{DotNetChannel}} is an SSM document
+      # parameter and must reach the deployed document literally. There are
+      # intentionally NO ${...} CloudFormation variables in this script.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install a .NET SDK channel side by side into /opt/dotnet, symlink
+          /usr/bin/dotnet and expose DOTNET_ROOT through
+          /etc/profile.d/dotnet.sh. Works on x86_64 and arm64 Amazon Linux.
+        parameters:
+          DotNetChannel:
+            type: String
+            description: .NET SDK channel to install (e.g. 8.0, 10.0).
+            default: "10.0"
+        mainSteps:
+          - action: aws:runShellScript
+            name: installDotNetSdk
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                # dotnet-install.sh resolves paths from HOME; SSM leaves it unset.
+                - export HOME=/root
+                - dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++ util-linux
+                - INSTALL_DIR=/opt/dotnet
+                - mkdir -p "$INSTALL_DIR"
+                - curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+                # Channels install into the same directory and share the
+                # dotnet host files; the 8.0 and 10.0 associations can run at
+                # the same time, so serialize them with a lock.
+                - flock /var/lock/clouddev-dotnet-install.lock bash /tmp/dotnet-install.sh --channel "{{DotNetChannel}}" --install-dir "$INSTALL_DIR" --no-path
+                - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
+                - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
+                - chmod +x /etc/profile.d/dotnet.sh
+                - /usr/bin/dotnet --list-sdks
+
   # Tag-targeted SSM State Manager association that applies the Node config
   # document to every dev server tagged CloudDevNodeConfig=enabled. Lives in
   # this stack beside the document and references it with !Ref (NO
@@ -425,6 +470,36 @@ Resources:
       Name: !Ref AmazonLinuxPlaywrightDocument
       Targets:
         - Key: "tag:CloudDevPlaywrightConfig"
+          Values:
+            - enabled
+
+  # Tag-targeted associations that apply the .NET SDK document once per
+  # channel. Unlike the others, these pass DotNetChannel explicitly, since
+  # the same document serves both. Servers opt in per channel with
+  # CloudDevDotNet8Config / CloudDevDotNet10Config = enabled.
+  DotNet8ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-dotnet8"
+      Name: !Ref AmazonLinuxDotNetSdkDocument
+      Parameters:
+        DotNetChannel:
+          - "8.0"
+      Targets:
+        - Key: "tag:CloudDevDotNet8Config"
+          Values:
+            - enabled
+
+  DotNet10ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-dotnet10"
+      Name: !Ref AmazonLinuxDotNetSdkDocument
+      Parameters:
+        DotNetChannel:
+          - "10.0"
+      Targets:
+        - Key: "tag:CloudDevDotNet10Config"
           Values:
             - enabled
 
@@ -726,6 +801,14 @@ Outputs:
     Value: !Ref AmazonLinuxPlaywrightDocument
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxPlaywrightDocumentName"
+
+  AmazonLinuxDotNetSdkDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs a .NET SDK
+      channel (DotNetChannel parameter) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxDotNetSdkDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxDotNetSdkDocumentName"
 
   VpcId:
     Condition: CreateVpc

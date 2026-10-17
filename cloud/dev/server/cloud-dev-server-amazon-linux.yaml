@@ -26,6 +26,8 @@ Metadata:
         Parameters:
           - EnablePowerShell
           - EnablePlaywright
+          - EnableDotNet8
+          - EnableDotNet10
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
@@ -39,6 +41,10 @@ Metadata:
         default: Install PowerShell
       EnablePlaywright:
         default: Install Playwright dependencies
+      EnableDotNet8:
+        default: Install .NET 8 SDK
+      EnableDotNet10:
+        default: Install .NET 10 SDK
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -161,6 +167,26 @@ Parameters:
       - "true"
       - "false"
 
+  EnableDotNet8:
+    Type: String
+    Description: >-
+      Install the .NET 8 SDK (side by side under /opt/dotnet) by applying the
+      shared .NET SDK SSM document from the environment stack.
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableDotNet10:
+    Type: String
+    Description: >-
+      Install the .NET 10 SDK (side by side under /opt/dotnet) by applying the
+      shared .NET SDK SSM document from the environment stack.
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
   # PowerShellVersion is intentionally NOT a server-stack parameter. The
   # fleet-wide PowerShell version is owned by the CloudDev environment stack
   # (its DefaultPowerShellVersion param, baked into the PowerShell SSM
@@ -174,6 +200,8 @@ Conditions:
   IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
   PowerShellEnabled: !Equals [!Ref EnablePowerShell, "true"]
   PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
+  DotNet8Enabled: !Equals [!Ref EnableDotNet8, "true"]
+  DotNet10Enabled: !Equals [!Ref EnableDotNet10, "true"]
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -234,6 +262,11 @@ Resources:
         # EnablePlaywright=true (same enabled/disabled pattern as above).
         - Key: CloudDevPlaywrightConfig
           Value: !If [PlaywrightEnabled, "enabled", "disabled"]
+        # Opt into the environment stack's per-channel .NET SDK associations.
+        - Key: CloudDevDotNet8Config
+          Value: !If [DotNet8Enabled, "enabled", "disabled"]
+        - Key: CloudDevDotNet10Config
+          Value: !If [DotNet10Enabled, "enabled", "disabled"]
       UserData:
         Fn::Base64:
           Fn::Sub:
