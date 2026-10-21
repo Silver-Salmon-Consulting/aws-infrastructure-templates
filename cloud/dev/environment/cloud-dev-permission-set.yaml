@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  IAM Identity Center permission set for CloudDev developers. Grants starting,
+  stopping and rebooting the dev servers of one CloudDev environment, and
+  applying that environment's SSM documents to them (Run Command, or
+  re-running the tag-targeted associations). Deploy in the Identity Center
+  management (or delegated administrator) account, then assign the permission
+  set to the account(s) that host the environment.
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: IAM Identity Center
+        Parameters:
+          - InstanceArn
+          - PermissionSetName
+          - SessionDuration
+      - Label:
+          default: Shared environment (from CloudDev environment stack)
+        Parameters:
+          - EnvironmentStackName
+    ParameterLabels:
+      InstanceArn:
+        default: Identity Center instance ARN
+      PermissionSetName:
+        default: Permission set name
+      SessionDuration:
+        default: Session duration
+      EnvironmentStackName:
+        default: CloudDev environment stack name
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  InstanceArn:
+    Type: String
+    Description: >-
+      ARN of the IAM Identity Center instance
+      (`aws sso-admin list-instances`), e.g.
+      arn:aws:sso:::instance/ssoins-1234567890abcdef.
+    AllowedPattern: ^arn:aws[a-z-]*:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$
+    ConstraintDescription: Must be an Identity Center instance ARN.
+
+  PermissionSetName:
+    Type: String
+    Description: Name shown in the AWS access portal (max 32 characters).
+    Default: CloudDevDeveloper
+    AllowedPattern: ^[\w+=,.@-]{1,32}$
+    ConstraintDescription: 1-32 characters from [A-Za-z0-9_+=,.@-].
+
+  SessionDuration:
+    Type: String
+    Description: How long an access-portal session lasts (ISO 8601 duration).
+    Default: PT8H
+    AllowedValues:
+      - PT1H
+      - PT4H
+      - PT8H
+      - PT12H
+
+  EnvironmentStackName:
+    Type: String
+    Description: >-
+      Name of the CloudDev environment stack whose dev servers this permission
+      set manages. Instances are matched by their CloudDevEnvironment tag
+      (set by the server stacks), and documents by the stack-name prefix
+      CloudFormation gives them.
+    Default: CloudDevEnv
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+  # Permission sets are global, so resources below use wildcard regions and
+  # accounts; the tag and document-name conditions do the scoping.
+  DevServerPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref InstanceArn
+      Name: !Ref PermissionSetName
+      Description: !Sub "Start/stop ${EnvironmentStackName} dev servers and apply its SSM documents."
+      SessionDuration: !Ref SessionDuration
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Describe calls do not support resource-level permissions.
+          - Sid: DescribeInstances
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+              - ec2:DescribeTags
+            Resource: "*"
+
+          # Only instances tagged CloudDevEnvironment=<environment stack>.
+          # No terminate: instances belong to their server stacks.
+          - Sid: StartStopDevServers
+            Effect: Allow
+            Action:
+              - ec2:StartInstances
+              - ec2:StopInstances
+              - ec2:RebootInstances
+            Resource: arn:aws:ec2:*:*:instance/*
+            Condition:
+              StringEquals:
+                aws:ResourceTag/CloudDevEnvironment: !Ref EnvironmentStackName
+
+          # SendCommand is authorized against both the document and the
+          # target instance; each needs its own statement. CloudFormation
+          # names the environment's documents "<stack>-<LogicalId>-<suffix>",
+          # so the prefix limits this to that stack's documents (no
+          # AWS-RunShellScript or other arbitrary commands).
+          - Sid: SendEnvironmentDocuments
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: !Sub "arn:aws:ssm:*:*:document/${EnvironmentStackName}-*"
+
+          - Sid: SendCommandToDevServers
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: arn:aws:ec2:*:*:instance/*
+            Condition:
+              StringEquals:
+                ssm:resourceTag/CloudDevEnvironment: !Ref EnvironmentStackName
+
+          # Re-run the tag-targeted associations ("Apply association now").
+          # Association ARNs carry only a generated ID, so this cannot be
+          # narrowed to the environment's associations. It only re-applies
+          # existing associations to the targets they already match.
+          - Sid: ReapplyAssociations
+            Effect: Allow
+            Action: ssm:StartAssociationsOnce
+            Resource: arn:aws:ssm:*:*:association/*
+
+          # Follow and cancel commands, and browse documents/associations in
+          # the console. Read-only list/describe calls do not support
+          # resource-level permissions.
+          - Sid: ReadSsmStatus
+            Effect: Allow
+            Action:
+              - ssm:CancelCommand
+              - ssm:DescribeAssociation
+              - ssm:DescribeAssociationExecutions
+              - ssm:DescribeAssociationExecutionTargets
+              - ssm:DescribeDocument
+              - ssm:DescribeInstanceInformation
+              - ssm:GetCommandInvocation
+              - ssm:GetDocument
+              - ssm:ListAssociations
+              - ssm:ListCommandInvocations
+              - ssm:ListCommands
+              - ssm:ListDocuments
+              - ssm:ListInstanceAssociations
+            Resource: "*"
+
+          # Look up the document names from the environment stack's outputs.
+          - Sid: ReadEnvironmentStack
+            Effect: Allow
+            Action: cloudformation:DescribeStacks
+            Resource: !Sub "arn:aws:cloudformation:*:*:stack/${EnvironmentStackName}/*"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  PermissionSetArn:
+    Description: >-
+      ARN of the permission set. Assign it to users or groups for the
+      account(s) hosting the CloudDev environment.
+    Value: !GetAtt DevServerPermissionSet.PermissionSetArn

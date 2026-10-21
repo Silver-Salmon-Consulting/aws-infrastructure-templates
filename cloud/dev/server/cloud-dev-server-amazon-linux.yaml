@@ -278,6 +278,10 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-dev-server"
+        # Marks the instance as belonging to this CloudDev environment. The
+        # CloudDev permission set scopes start/stop and SSM commands to it.
+        - Key: CloudDevEnvironment
+          Value: !Ref EnvironmentStackName
         # Opts this server into the environment stack's NodeConfigAssociation
         # (installs Node/npm via the shared SSM document). Every dev server
         # gets Node. Remove this tag to decouple from the association.

@@ -17,6 +17,7 @@ boot scripts — so it is maintained centrally and re-appliable on demand.
 cloud/dev/
   environment/
     cloud-dev-environment.yaml          # shared: IAM role, log group, SSM documents, VPC
+    cloud-dev-permission-set.yaml       # Identity Center permission set for developers
   server/
     cloud-dev-server-amazon-linux.yaml      # x86_64 (AMD) dev server
     cloud-dev-server-amazon-linux-arm.yaml  # arm64 (Graviton) dev server
@@ -193,6 +194,28 @@ The instance reaches `CREATE_COMPLETE` once it boots and signals — **before**
 Node/PowerShell finish installing. Those install asynchronously via SSM State
 Manager after the instance registers; check their status in SSM association
 compliance (or just connect and run `node --version` / `pwsh --version`).
+
+### 3. (Optional) Deploy the developer permission set
+
+`cloud-dev-permission-set.yaml` creates an IAM Identity Center permission set
+that lets developers start, stop and reboot an environment's dev servers and
+apply its SSM documents to them, either with Run Command or by re-running the
+associations. It grants no terminate and no arbitrary commands
+(`AWS-RunShellScript`).
+
+```bash
+aws cloudformation deploy   --template-file cloud/dev/environment/cloud-dev-permission-set.yaml   --stack-name CloudDevPermissionSet   --parameter-overrides       InstanceArn=<arn:aws:sso:::instance/ssoins-...>       EnvironmentStackName=CloudDevEnv
+```
+
+- Deploy it in the Identity Center **management (or delegated administrator)
+  account**, then assign the permission set to users or groups for the account
+  that hosts the environment.
+- Instances are matched by their `CloudDevEnvironment` tag, which the server
+  stacks set to `EnvironmentStackName`. Update existing server stacks to add
+  that tag. The update changes the tag in place and does not replace the
+  instance.
+- Documents are matched by CloudFormation's `<EnvironmentStackName>-*` naming,
+  so only that environment's documents can be sent.
 
 ## Connecting
 
