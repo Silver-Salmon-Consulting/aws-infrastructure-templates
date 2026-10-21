@@ -30,6 +30,8 @@ Metadata:
           - EnablePlaywright
           - EnableDotNet8
           - EnableDotNet10
+          - K6MajorVersion
+          - AwsCliMajorVersion
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
@@ -47,6 +49,10 @@ Metadata:
         default: Install .NET 8 SDK
       EnableDotNet10:
         default: Install .NET 10 SDK
+      K6MajorVersion:
+        default: k6 major version
+      AwsCliMajorVersion:
+        default: AWS CLI (official installer) major version
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -190,6 +196,31 @@ Parameters:
       - "true"
       - "false"
 
+  # Versioned tools: the value IS the CloudDev<Tool>Config tag value, which
+  # selects the environment stack's matching per-major-version association
+  # (the newest release in that major is installed). "none" matches nothing.
+  K6MajorVersion:
+    Type: String
+    Description: >-
+      k6 major version to install into /usr/local/bin/k6 (latest release in
+      that major), or "none" to skip k6.
+    Default: none
+    AllowedValues:
+      - none
+      - v0
+      - v1
+
+  AwsCliMajorVersion:
+    Type: String
+    Description: >-
+      Install the latest AWS CLI release in this major version with AWS's
+      official installer (/usr/local/bin/aws), or "none" to keep only the
+      AL2023 awscli-2 package (/usr/bin/aws).
+    Default: none
+    AllowedValues:
+      - none
+      - v2
+
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
@@ -264,6 +295,15 @@ Resources:
           Value: !If [DotNet8Enabled, "enabled", "disabled"]
         - Key: CloudDevDotNet10Config
           Value: !If [DotNet10Enabled, "enabled", "disabled"]
+        # jq, zip and unzip. Every dev server gets them, like Node.
+        - Key: CloudDevBaseToolsConfig
+          Value: enabled
+        # Versioned tools: the tag value picks one per-major-version
+        # association (v0, v1, ...); "none" matches none of them.
+        - Key: CloudDevK6Config
+          Value: !Ref K6MajorVersion
+        - Key: CloudDevAwsCliConfig
+          Value: !Ref AwsCliMajorVersion
       UserData:
         Fn::Base64:
           Fn::Sub:

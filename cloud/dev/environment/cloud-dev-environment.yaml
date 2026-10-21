@@ -426,6 +426,189 @@ Resources:
                 - chmod +x /etc/profile.d/dotnet.sh
                 - /usr/bin/dotnet --list-sdks
 
+  # Managed SSM Command Document that installs small, unversioned CLI
+  # utilities from the Amazon Linux repos (jq, zip, unzip). These track the
+  # distro's packages, so there is no version parameter; tools whose version
+  # matters get their own per-major-version documents below.
+  AmazonLinuxBaseToolsDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # No SSM parameters and NO ${...} CloudFormation variables.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install jq, zip and unzip from the Amazon Linux repositories.
+        mainSteps:
+          - action: aws:runShellScript
+            name: installBaseTools
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - dnf install -y jq zip unzip
+                - jq --version
+
+  # Versioned tool documents: ONE DOCUMENT PER TOOL PER MAJOR VERSION. The
+  # major version is fixed by the document (and its name); the document's
+  # version parameter defaults to "latest", the newest release within that
+  # major, and also accepts an exact version to pin. A server picks a major
+  # with the tool's tag VALUE (e.g. CloudDevK6Config = v0 | v1), so it can
+  # only match one major's association at a time. Add a major by copying a
+  # document + association and changing the major number.
+  #
+  # k6 0.x: installs the k6 binary from Grafana's GitHub release tarball
+  # (amd64/arm64 picked from uname) into /usr/local/bin/k6. "latest" is
+  # resolved from the repo's release tags with git ls-remote (no GitHub API
+  # rate limit), ignoring pre-release tags.
+  AmazonLinuxK6V0Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{K6Version}} is an SSM document parameter
+      # and must reach the deployed document literally.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install k6 0.x into /usr/local/bin/k6 from Grafana's GitHub release
+          tarball. Works on x86_64 and arm64 Amazon Linux.
+        parameters:
+          K6Version:
+            type: String
+            description: >-
+              k6 0.x version to install (e.g. 0.55.0), or "latest" for the
+              newest 0.x release.
+            default: latest
+            allowedPattern: ^(latest|0\.\d+\.\d+)$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installK6
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - K6_MAJOR=0
+                - K6_VERSION="{{K6Version}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  K6_ARCH="amd64" ;;
+                    aarch64) K6_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y git tar gzip
+                - |
+                  if [ "$K6_VERSION" = "latest" ]; then
+                    K6_VERSION=$(git ls-remote --tags --refs https://github.com/grafana/k6.git "v$K6_MAJOR.*" \
+                      | sed -n "s|.*refs/tags/v\($K6_MAJOR\.[0-9]*\.[0-9]*\)$|\1|p" | sort -V | tail -n 1)
+                    [ -n "$K6_VERSION" ] || { echo "No k6 v$K6_MAJOR release found" >&2; exit 1; }
+                  fi
+                - TMP_DIR=$(mktemp -d)
+                - curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" | tar -xz -C "$TMP_DIR"
+                - install -m 0755 "$TMP_DIR/k6-v$K6_VERSION-linux-$K6_ARCH/k6" /usr/local/bin/k6
+                - rm -rf "$TMP_DIR"
+                - /usr/local/bin/k6 version
+
+  # k6 1.x: same script as the 0.x document with K6_MAJOR=1.
+  AmazonLinuxK6V1Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{K6Version}} is an SSM document parameter
+      # and must reach the deployed document literally.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install k6 1.x into /usr/local/bin/k6 from Grafana's GitHub release
+          tarball. Works on x86_64 and arm64 Amazon Linux.
+        parameters:
+          K6Version:
+            type: String
+            description: >-
+              k6 1.x version to install (e.g. 1.3.0), or "latest" for the
+              newest 1.x release.
+            default: latest
+            allowedPattern: ^(latest|1\.\d+\.\d+)$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installK6
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - K6_MAJOR=1
+                - K6_VERSION="{{K6Version}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  K6_ARCH="amd64" ;;
+                    aarch64) K6_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y git tar gzip
+                - |
+                  if [ "$K6_VERSION" = "latest" ]; then
+                    K6_VERSION=$(git ls-remote --tags --refs https://github.com/grafana/k6.git "v$K6_MAJOR.*" \
+                      | sed -n "s|.*refs/tags/v\($K6_MAJOR\.[0-9]*\.[0-9]*\)$|\1|p" | sort -V | tail -n 1)
+                    [ -n "$K6_VERSION" ] || { echo "No k6 v$K6_MAJOR release found" >&2; exit 1; }
+                  fi
+                - TMP_DIR=$(mktemp -d)
+                - curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" | tar -xz -C "$TMP_DIR"
+                - install -m 0755 "$TMP_DIR/k6-v$K6_VERSION-linux-$K6_ARCH/k6" /usr/local/bin/k6
+                - rm -rf "$TMP_DIR"
+                - /usr/local/bin/k6 version
+
+  # AWS CLI 2.x from AWS's official installer into /usr/local/aws-cli, with
+  # /usr/local/bin/aws. AL2023 also ships an (older, distro-paced) awscli-2
+  # RPM at /usr/bin/aws; it is left in place because UserData uses it to
+  # signal CloudFormation, and /usr/local/bin comes first on login shells'
+  # PATH. (sudo's secure_path omits /usr/local/bin, so `sudo aws` still runs
+  # the RPM build.) --update makes re-runs upgrade or re-pin in place.
+  AmazonLinuxAwsCliV2Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{AwsCliVersion}} is an SSM document
+      # parameter and must reach the deployed document literally.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install AWS CLI v2 with AWS's official installer into
+          /usr/local/aws-cli and /usr/local/bin/aws. Works on x86_64 and arm64
+          Amazon Linux.
+        parameters:
+          AwsCliVersion:
+            type: String
+            description: >-
+              AWS CLI 2.x version to install (e.g. 2.31.0), or "latest" for the
+              newest 2.x release.
+            default: latest
+            allowedPattern: ^(latest|2\.\d+\.\d+)$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installAwsCli
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - AWSCLI_VERSION="{{AwsCliVersion}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64|aarch64) AWSCLI_ARCH="$(uname -m)" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y unzip
+                - |
+                  if [ "$AWSCLI_VERSION" = "latest" ]; then
+                    ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH.zip"
+                  else
+                    ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH-$AWSCLI_VERSION.zip"
+                  fi
+                - TMP_DIR=$(mktemp -d)
+                - curl -sSfL "https://awscli.amazonaws.com/$ZIP_NAME" -o "$TMP_DIR/awscliv2.zip"
+                - unzip -q "$TMP_DIR/awscliv2.zip" -d "$TMP_DIR"
+                - '"$TMP_DIR/aws/install" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin --update'
+                - rm -rf "$TMP_DIR"
+                - /usr/local/bin/aws --version
+
   # Tag-targeted SSM State Manager association that applies the Node config
   # document to every dev server tagged CloudDevNodeConfig=enabled. Lives in
   # this stack beside the document and references it with !Ref (NO
@@ -502,6 +685,52 @@ Resources:
         - Key: "tag:CloudDevDotNet10Config"
           Values:
             - enabled
+
+  # Tag-targeted association that applies the base tools document. Every dev
+  # server tags itself CloudDevBaseToolsConfig=enabled, like Node.
+  BaseToolsConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-base-tools"
+      Name: !Ref AmazonLinuxBaseToolsDocument
+      Targets:
+        - Key: "tag:CloudDevBaseToolsConfig"
+          Values:
+            - enabled
+
+  # Per-major-version associations. All k6 majors share one tag key and
+  # differ by tag VALUE, so a server matches at most one of them; switching
+  # the value and re-applying replaces /usr/local/bin/k6. No Parameters: the
+  # document default ("latest" within its major) governs.
+  K6V0ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-k6-v0"
+      Name: !Ref AmazonLinuxK6V0Document
+      Targets:
+        - Key: "tag:CloudDevK6Config"
+          Values:
+            - v0
+
+  K6V1ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-k6-v1"
+      Name: !Ref AmazonLinuxK6V1Document
+      Targets:
+        - Key: "tag:CloudDevK6Config"
+          Values:
+            - v1
+
+  AwsCliV2ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-awscli-v2"
+      Name: !Ref AmazonLinuxAwsCliV2Document
+      Targets:
+        - Key: "tag:CloudDevAwsCliConfig"
+          Values:
+            - v2
 
   # ---- VPC + public networking (created when VpcMode != none) ----
   Vpc:
@@ -809,6 +1038,38 @@ Outputs:
     Value: !Ref AmazonLinuxDotNetSdkDocument
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxDotNetSdkDocumentName"
+
+  AmazonLinuxBaseToolsDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs jq, zip and unzip
+      on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxBaseToolsDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxBaseToolsDocumentName"
+
+  AmazonLinuxK6V0DocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs k6 0.x
+      (K6Version parameter, default latest 0.x) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxK6V0Document
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxK6V0DocumentName"
+
+  AmazonLinuxK6V1DocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs k6 1.x
+      (K6Version parameter, default latest 1.x) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxK6V1Document
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxK6V1DocumentName"
+
+  AmazonLinuxAwsCliV2DocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs AWS CLI 2.x
+      (AwsCliVersion parameter, default latest 2.x) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxAwsCliV2Document
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxAwsCliV2DocumentName"
 
   VpcId:
     Condition: CreateVpc

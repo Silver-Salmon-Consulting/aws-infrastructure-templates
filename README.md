@@ -8,8 +8,8 @@ template is standalone YAML with no build step. They are validated in CI with
 
 The first set of templates provisions remote development servers on EC2, split
 into a shared **environment** stack and one or more **server** stacks. Server
-configuration (Node.js, PowerShell, Playwright dependencies, .NET SDKs) is
-delivered through managed, versioned AWS
+configuration (Node.js, PowerShell, Playwright dependencies, .NET SDKs, k6,
+the AWS CLI and small CLI utilities) is delivered through managed, versioned AWS
 Systems Manager (SSM) documents applied by tag, rather than baked into instance
 boot scripts — so it is maintained centrally and re-appliable on demand.
 
@@ -31,11 +31,13 @@ cloud/dev/
     plus scoped inline policies that let the instances signal CloudFormation and
     write bootstrap logs;
   - a CloudWatch Logs group for instance bootstrap output;
-  - four SSM Command Documents — one installs Node.js/npm via nvm, one
+  - eight SSM Command Documents — one installs Node.js/npm via nvm, one
     installs PowerShell (per-architecture tarball, works on x86_64 and arm64),
-    one installs the system libraries/fonts Playwright's Chromium needs, and
-    one installs a .NET SDK channel (`DotNetChannel` parameter);
-  - five **tag-targeted** SSM State Manager associations that apply those
+    one installs the system libraries/fonts Playwright's Chromium needs, one
+    installs a .NET SDK channel (`DotNetChannel` parameter), one installs
+    jq/zip/unzip, and three are per-major-version tool documents (k6 0.x,
+    k6 1.x, AWS CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
+  - nine **tag-targeted** SSM State Manager associations that apply those
     documents to any instance carrying the matching tag;
   - an optional VPC (`public` or `public-private`, 1–3 AZs).
 - **Server stacks** (`cloud-dev-server-*.yaml`) — each launches one EC2 instance.
@@ -63,6 +65,10 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
      (passes `DotNetChannel=8.0`)
    - `DotNet10ConfigAssociation` targets `tag:CloudDevDotNet10Config = enabled`
      (passes `DotNetChannel=10.0`)
+   - `BaseToolsConfigAssociation` targets `tag:CloudDevBaseToolsConfig = enabled`
+   - `K6V0ConfigAssociation` / `K6V1ConfigAssociation` target
+     `tag:CloudDevK6Config = v0` / `v1`
+   - `AwsCliV2ConfigAssociation` targets `tag:CloudDevAwsCliConfig = v2`
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
    - `CloudDevPowerShellConfig = enabled` when `EnablePowerShell=true`, else
@@ -71,6 +77,9 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
      (default `false`), else `disabled`
    - `CloudDevDotNet8Config` / `CloudDevDotNet10Config = enabled` when
      `EnableDotNet8` / `EnableDotNet10=true` (both default `false`)
+   - `CloudDevBaseToolsConfig = enabled` (always — jq, zip and unzip)
+   - `CloudDevK6Config = <K6MajorVersion>` (`none` / `v0` / `v1`, default `none`)
+   - `CloudDevAwsCliConfig = <AwsCliMajorVersion>` (`none` / `v2`, default `none`)
 
 The .NET SDKs install side by side into `/opt/dotnet` (via Microsoft's
 `dotnet-install.sh`, x64 or arm64 automatically), with `/usr/bin/dotnet`
@@ -82,6 +91,37 @@ The Playwright document installs only OS dependencies (the dnf equivalent of
 binaries are versioned per project, so run `npx playwright install chromium` in
 the project. Chromium is the supported engine on Amazon Linux; Playwright's
 WebKit and Firefox builds target Ubuntu.
+
+### Versioned tool documents
+
+Tools whose version matters to a project (k6, the AWS CLI) follow one pattern:
+**one SSM document per tool per major version**, for example
+`AmazonLinuxK6V0Document` and `AmazonLinuxK6V1Document`.
+
+- The document fixes the major version. Its version parameter (`K6Version`,
+  `AwsCliVersion`) defaults to `latest`, the newest release **within that
+  major**, and also accepts an exact version (`0.55.0`), checked against the
+  major by `allowedPattern`.
+- Each major has its own association. All majors of a tool share one tag key
+  and differ by tag **value**, so a server selects exactly one major
+  (`CloudDevK6Config = v0`), and `none` selects nothing. Server stacks expose
+  this as `K6MajorVersion` / `AwsCliMajorVersion`.
+- To add a major, copy the document and association, change the major number,
+  and add the value to the server stacks' `AllowedValues`.
+- Re-applying an association upgrades to the newest release in that major.
+  Changing a server's tag value and re-applying switches majors.
+
+To pin an exact version on one server, run the document with Run Command:
+
+```bash
+aws ssm send-command --instance-ids <instance-id>   --document-name <AmazonLinuxK6V0DocumentName output>   --parameters K6Version=0.55.0
+```
+
+The AWS CLI document installs AWS's official v2 build at `/usr/local/bin/aws`,
+which comes first on PATH. It leaves the AL2023 `awscli-2` RPM
+(`/usr/bin/aws`) in place, because UserData uses it to signal CloudFormation.
+Small unversioned utilities (jq, zip, unzip) come from dnf through the base
+tools document.
 
 Because the association lives beside the document in the environment stack and
 references it directly, server stacks have **no cross-stack dependency on the
