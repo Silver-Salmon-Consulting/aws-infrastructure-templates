@@ -356,6 +356,82 @@ aws cloudformation deploy \
 | `PreservePath` | `false` | `true` appends the request path and query string (`/a?b=c` → `RedirectUrl/a?b=c`) |
 | `IncludeWww` | `false` | Also redirect `www.DomainName` |
 
+## GitHub Actions ephemeral Fargate runners
+
+`github/runner/github-actions-fargate-runner.yaml` deploys on-demand,
+single-use GitHub Actions self-hosted runners on AWS Fargate. Idle, nothing runs
+(no EC2, no containers); each queued job gets its own fresh task.
+
+```
+GitHub workflow_job webhook
+  -> API Gateway (HTTP API, POST /webhook)
+  -> Lambda "webhook": verifies X-Hub-Signature-256 (HMAC), filters repo/labels
+  -> SQS queue (+ DLQ): buffers and rate-limits
+  -> Lambda "scale-up": confirms the job is still queued, enforces MaxRunners,
+     creates a just-in-time (JIT) runner via the GitHub API, calls ecs:RunTask
+  -> Fargate task (one container): run.sh --jitconfig  -> runs ONE job -> exits
+```
+
+A JIT runner accepts exactly one job and GitHub removes it afterwards, so the
+container needs no PAT and no deregistration step; the PAT only lives in
+Secrets Manager and the scale-up Lambda. The stack creates a VPC (2 public + 2
+private subnets, S3 gateway endpoint, optional ECR/Logs interface endpoints), an
+ECR repository, an ECS cluster with `FARGATE` and `FARGATE_SPOT`, and all IAM
+roles (separate roles for each Lambda, the task execution role, and a task role
+that holds the AWS permissions your jobs get).
+
+```bash
+# 1. Deploy (the template has a Lambda and IAM roles, so CAPABILITY_IAM is needed)
+aws cloudformation deploy \
+  --template-file github/runner/github-actions-fargate-runner.yaml \
+  --stack-name gha-fargate-runner --capabilities CAPABILITY_IAM \
+  --parameter-overrides GitHubOrg=my-org GitHubRepo=my-repo \
+      GitHubPat=<token> RunnerLabels=fargate
+
+# 2. Build and push the runner image (outputs: RunnerRepositoryUri)
+cd github/runner/image
+aws ecr get-login-password | docker login --username AWS --password-stdin <repo-uri-host>
+docker buildx build --platform linux/amd64 -t <RunnerRepositoryUri>:latest --push .
+
+# 3. In GitHub: Settings -> Webhooks -> Add webhook
+#    Payload URL = WebhookUrl output, content type application/json,
+#    Secret = output of the WebhookSecretCommand output, event = "Workflow jobs"
+
+# 4. In workflows
+#    runs-on: [self-hosted, linux, x64, fargate]
+```
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `GitHubOrg` | *(required)* | Organization or user |
+| `GitHubRepo` | blank | Repository name; blank = organization-level runners |
+| `GitHubPat` | *(required)* | Token for the scale-up Lambda (fine-grained: repo "Administration: write" + "Actions: read", or org "Self-hosted runners: write") |
+| `RunnerGroupId` | `1` | Runner group (org runners) |
+| `RunnerLabels` | `fargate` | Custom labels; `self-hosted`, `linux`, `x64`/`arm64` always added |
+| `ContainerImage` | blank | Image URI; blank = the stack's ECR repository `:latest` |
+| `CpuArchitecture` | `X86_64` | `X86_64` or `ARM64` (must match the image) |
+| `TaskCpu` / `TaskMemory` / `EphemeralStorageGiB` | `2048` / `4096` / `30` | Task size |
+| `UseFargateSpot` | `false` | Spot is cheaper, but interruptions fail the running job |
+| `MaxRunners` | `10` | Concurrent task cap; extra jobs wait in SQS |
+| `MaxRunnerSeconds` | `21600` | Hard per-task time limit (also reaps runners that never get a job) |
+| `RunnerManagedPolicyArn` | blank | Managed policy giving jobs AWS permissions |
+| `NatMode` | `SingleNat` | `SingleNat` = private subnets + one NAT (~$32/month idle); `PublicIp` = public subnets, no NAT, no idle cost, still no inbound |
+| `CreateInterfaceEndpoints` | `false` | ECR/Logs interface endpoints (hourly cost) |
+
+Notes and limits:
+
+- **Idle cost** is zero except the NAT gateway in the default `SingleNat` mode
+  (Secrets Manager secrets are about $0.80/month). Use `NatMode=PublicIp` for a
+  truly pay-per-job setup; runner tasks still have no inbound access.
+- Runners reach github.com, so private subnets need the NAT; the endpoints only
+  save NAT data charges.
+- Fargate cannot run Docker-in-Docker or privileged containers, so jobs that
+  build images with the Docker daemon need Kaniko/Buildah or a different runner.
+- Jobs wait up to an hour in the queue when `MaxRunners` is reached, then are
+  dropped; GitHub fails jobs that stay queued 24 hours anyway.
+- The JIT config is passed to the task as an environment override; it is
+  single-use and only valid for that one runner.
+
 ## Roadmap / parked ideas
 
 - **Ubuntu dev server** — a sibling of the Amazon Linux server templates (apt,

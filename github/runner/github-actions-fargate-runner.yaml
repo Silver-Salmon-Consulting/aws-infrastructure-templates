@@ -1,0 +1,851 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  On-demand, ephemeral GitHub Actions self-hosted runners on AWS Fargate. A
+  GitHub workflow_job webhook hits API Gateway, a Lambda validates the HMAC
+  signature and enqueues the job in SQS, and a second Lambda registers a
+  just-in-time (JIT) runner and starts a Fargate task that runs exactly one job
+  and exits. Nothing runs when idle (see NatMode for the one optional idle cost).
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: GitHub
+        Parameters:
+          - GitHubOrg
+          - GitHubRepo
+          - GitHubPat
+          - RunnerGroupId
+          - RunnerLabels
+      - Label:
+          default: Runner container
+        Parameters:
+          - ContainerImage
+          - CpuArchitecture
+          - TaskCpu
+          - TaskMemory
+          - EphemeralStorageGiB
+          - UseFargateSpot
+          - MaxRunnerSeconds
+          - RunnerManagedPolicyArn
+      - Label:
+          default: Scaling
+        Parameters:
+          - MaxRunners
+      - Label:
+          default: Network
+        Parameters:
+          - VpcCidr
+          - NatMode
+          - CreateInterfaceEndpoints
+      - Label:
+          default: Logging
+        Parameters:
+          - LogRetentionDays
+    ParameterLabels:
+      GitHubOrg:
+        default: GitHub organization (or user)
+      GitHubRepo:
+        default: GitHub repository (blank = organization-level runners)
+      GitHubPat:
+        default: GitHub personal access token
+      RunnerGroupId:
+        default: Runner group ID
+      RunnerLabels:
+        default: Custom runner labels
+      ContainerImage:
+        default: Runner container image (blank = use the stack's ECR repository)
+      UseFargateSpot:
+        default: Use Fargate Spot
+      MaxRunners:
+        default: Maximum concurrent runners
+      NatMode:
+        default: Outbound internet for runners
+      CreateInterfaceEndpoints:
+        default: Create ECR / CloudWatch Logs interface endpoints
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or user that owns the repository.
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9-]*$"
+    ConstraintDescription: Must be a valid GitHub organization or user name.
+
+  GitHubRepo:
+    Type: String
+    Default: ""
+    Description: >-
+      Repository name (without the owner). Leave blank to register
+      organization-level runners, which requires GitHubOrg to be an organization
+      and serves every repository the runner group allows.
+    AllowedPattern: "^[A-Za-z0-9._-]*$"
+
+  GitHubPat:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: >-
+      Token used by the scale-up Lambda to read job status and create JIT
+      runners; stored in Secrets Manager and never given to the runner. Fine-grained
+      PAT - repository runners need "Administration: write" and "Actions: read";
+      organization runners need "Self-hosted runners: write" (org) and "Actions:
+      read". Classic PAT - "repo" (repository) or "admin:org" + "repo" (org).
+
+  RunnerGroupId:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: >-
+      Runner group the runners join. 1 is the "Default" group; for repository
+      runners always leave this at 1.
+
+  RunnerLabels:
+    Type: String
+    Default: fargate
+    AllowedPattern: "^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$"
+    Description: >-
+      Comma-separated custom labels, no spaces. "self-hosted", "linux" and the
+      architecture label (x64 / arm64) are always added. A job is only run if
+      every label in its runs-on is one of the runner's labels.
+
+  ContainerImage:
+    Type: String
+    Default: ""
+    Description: >-
+      Full image URI for the runner container (see image/Dockerfile). Leave
+      blank to use <stack ECR repository>:latest, which you must push before the
+      first job runs (the repository URI is in the stack outputs).
+
+  CpuArchitecture:
+    Type: String
+    Default: X86_64
+    AllowedValues: [X86_64, ARM64]
+    Description: Must match the architecture the container image was built for.
+
+  TaskCpu:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["256", "512", "1024", "2048", "4096", "8192", "16384"]
+    Description: Fargate task CPU units. Must be a valid combination with TaskMemory.
+
+  TaskMemory:
+    Type: String
+    Default: "4096"
+    Description: Fargate task memory in MiB. Must be a valid combination with TaskCpu.
+
+  EphemeralStorageGiB:
+    Type: Number
+    Default: 30
+    MinValue: 21
+    MaxValue: 200
+    Description: Task ephemeral storage in GiB (work directory, checkouts, caches).
+
+  UseFargateSpot:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Run on Fargate Spot for up to ~70% savings. Spot tasks can be interrupted
+      with a 2 minute warning, which fails the running job (re-run it).
+
+  MaxRunnerSeconds:
+    Type: Number
+    Default: 21600
+    MinValue: 300
+    Description: >-
+      Hard time limit per runner task. Also reaps runners that never receive a
+      job. Set higher than your longest job.
+
+  RunnerManagedPolicyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional IAM managed policy ARN attached to the task role, i.e. the AWS
+      permissions your workflow jobs get (the role has none by default).
+
+  MaxRunners:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: >-
+      Upper bound on concurrent runner tasks. Excess jobs wait in SQS (up to
+      about an hour) until a slot frees up.
+
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/(1[6-9]|2[0-4])$"
+    Description: CIDR for the new VPC (/16 to /24). Split into two public and two private subnets.
+
+  NatMode:
+    Type: String
+    Default: SingleNat
+    AllowedValues: [SingleNat, PublicIp]
+    Description: >-
+      How runners reach github.com. SingleNat runs tasks in private subnets
+      behind one NAT gateway (about $32/month while the stack exists, even when
+      idle). PublicIp runs tasks in public subnets with a public IP and no NAT
+      (no idle cost); the security group still has no inbound rules.
+
+  CreateInterfaceEndpoints:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Add ECR and CloudWatch Logs interface endpoints to keep image pulls and
+      logs off the NAT gateway. They bill hourly per AZ, so only worth it for
+      heavy image traffic. The S3 gateway endpoint is always created (free).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: CloudWatch Logs retention for the Lambdas and runner tasks.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  UseDefaultImage: !Equals [!Ref ContainerImage, ""]
+  IsArm: !Equals [!Ref CpuArchitecture, ARM64]
+  UseSpot: !Equals [!Ref UseFargateSpot, "true"]
+  UseNat: !Equals [!Ref NatMode, SingleNat]
+  UseEndpoints: !Equals [!Ref CreateInterfaceEndpoints, "true"]
+  HasRunnerPolicy: !Not [!Equals [!Ref RunnerManagedPolicyArn, ""]]
+
+Resources:
+  # =========================================================================
+  # Secrets
+  # =========================================================================
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: HMAC secret to enter as the GitHub webhook "Secret".
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  PatSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: GitHub token used by the scale-up Lambda.
+      SecretString: !Ref GitHubPat
+
+  # =========================================================================
+  # Network
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-a" }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-b" }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-a" }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-b" }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UseNat
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNat
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: UseNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Runner tasks - no inbound, all outbound.
+      VpcId: !Ref Vpc
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseEndpoints
+    Properties:
+      GroupDescription: Interface endpoints - HTTPS from runner tasks.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref RunnerSecurityGroup
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: UseEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # =========================================================================
+  # Queue
+  # =========================================================================
+  JobDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDeadLetterQueue.Arn
+        maxReceiveCount: 60
+
+  # =========================================================================
+  # Container registry, cluster, task
+  # =========================================================================
+  RunnerRepository:
+    Type: AWS::ECR::Repository
+    Condition: UseDefaultImage
+    Properties:
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Keep last 5 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},
+          "action":{"type":"expire"}}]}
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !If [UseSpot, FARGATE_SPOT, FARGATE]
+          Weight: 1
+
+  RunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-runner"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # What the workflow job itself can do in AWS. No permissions by default.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: !If [HasRunnerPolicy, [!Ref RunnerManagedPolicyArn], !Ref "AWS::NoValue"]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runner"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      EphemeralStorage:
+        SizeInGiB: !Ref EphemeralStorageGiB
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: !Ref CpuArchitecture
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: runner
+          Image: !If [UseDefaultImage, !Sub "${RunnerRepository.RepositoryUri}:latest", !Ref ContainerImage]
+          Essential: true
+          StopTimeout: 120
+          Environment:
+            - Name: RUNNER_MAX_SECONDS
+              Value: !Ref MaxRunnerSeconds
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+
+  # =========================================================================
+  # Webhook handler (API Gateway -> Lambda -> SQS)
+  # =========================================================================
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: webhook
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogStream
+                Resource: !GetAtt WebhookLogGroup.Arn
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !Sub "${WebhookLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt JobQueue.Arn
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-webhook"
+      Description: Validates GitHub workflow_job webhooks and enqueues queued jobs.
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt WebhookRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref WebhookLogGroup
+      Environment:
+        Variables:
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecret
+          QUEUE_URL: !Ref JobQueue
+          OWNER: !Ref GitHubOrg
+          REPO: !Ref GitHubRepo
+          RUNNER_LABELS: !Join
+            - ","
+            - - self-hosted,linux
+              - !If [IsArm, arm64, x64]
+              - !Ref RunnerLabels
+      Code:
+        ZipFile: |
+          import base64, hashlib, hmac, json, os, boto3
+          E = os.environ
+          sm, sqs = boto3.client("secretsmanager"), boto3.client("sqs")
+          KEY = None
+          OURS = {x.strip().lower() for x in E["RUNNER_LABELS"].split(",")}
+
+          def out(code, msg):
+              print(code, msg)
+              return {"statusCode": code, "body": msg}
+
+          def handler(event, context):
+              global KEY
+              KEY = KEY or sm.get_secret_value(SecretId=E["WEBHOOK_SECRET_ARN"])["SecretString"].encode()
+              raw = event.get("body") or ""
+              raw = base64.b64decode(raw) if event.get("isBase64Encoded") else raw.encode()
+              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              want = "sha256=" + hmac.new(KEY, raw, hashlib.sha256).hexdigest()
+              if not hmac.compare_digest(h.get("x-hub-signature-256", ""), want):
+                  return out(401, "bad signature")
+              if h.get("x-github-event") == "ping":
+                  return out(200, "pong")
+              p = json.loads(raw)
+              if h.get("x-github-event") != "workflow_job" or p.get("action") != "queued":
+                  return out(202, "ignored event")
+              job, repo = p["workflow_job"], p["repository"]["full_name"]
+              want_repo = E["OWNER"] + "/" + E["REPO"] if E["REPO"] else E["OWNER"] + "/"
+              if not repo.lower().startswith(want_repo.lower()) or (E["REPO"] and repo.lower() != want_repo.lower()):
+                  return out(202, "ignored repo " + repo)
+              labels = {x.lower() for x in job.get("labels", [])}
+              if "self-hosted" not in labels or not labels <= OURS:
+                  return out(202, "ignored labels")
+              sqs.send_message(QueueUrl=E["QUEUE_URL"], MessageBody=json.dumps({"job_id": job["id"], "repo": repo}))
+              return out(202, "queued job %s" % job["id"])
+
+  WebhookApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-webhook"
+      ProtocolType: HTTP
+
+  WebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebhookApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebhookApi
+      RouteKey: POST /webhook
+      Target: !Sub "integrations/${WebhookIntegration}"
+
+  WebhookStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebhookApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+
+  WebhookInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/webhook"
+
+  # =========================================================================
+  # Scale-up handler (SQS -> Lambda -> JIT config -> Fargate RunTask)
+  # =========================================================================
+  ScaleUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-scale-up"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ScaleUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: scale-up
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogStream
+                Resource: !GetAtt ScaleUpLogGroup.Arn
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !Sub "${ScaleUpLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PatSecret
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}-runner:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  ScaleUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-scale-up"
+      Description: Registers a JIT runner and starts a Fargate task for one queued job.
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt ScaleUpRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ScaleUpLogGroup
+      Environment:
+        Variables:
+          PAT_SECRET_ARN: !Ref PatSecret
+          OWNER: !Ref GitHubOrg
+          REPO: !Ref GitHubRepo
+          RUNNER_GROUP_ID: !Ref RunnerGroupId
+          RUNNER_LABELS: !Join
+            - ","
+            - - self-hosted,linux
+              - !If [IsArm, arm64, x64]
+              - !Ref RunnerLabels
+          MAX_RUNNERS: !Ref MaxRunners
+          CLUSTER: !Ref Cluster
+          TASK_DEFINITION: !Ref TaskDefinition
+          CAPACITY_PROVIDER: !If [UseSpot, FARGATE_SPOT, FARGATE]
+          SUBNETS: !If
+            - UseNat
+            - !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+            - !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+          SECURITY_GROUP: !Ref RunnerSecurityGroup
+          ASSIGN_PUBLIC_IP: !If [UseNat, DISABLED, ENABLED]
+      Code:
+        ZipFile: |
+          import json, os, urllib.error, urllib.request, boto3
+          E = os.environ
+          ecs, sm = boto3.client("ecs"), boto3.client("secretsmanager")
+          PAT = None
+
+          def gh(method, path, body=None, ok=()):
+              global PAT
+              PAT = PAT or sm.get_secret_value(SecretId=E["PAT_SECRET_ARN"])["SecretString"]
+              req = urllib.request.Request(
+                  "https://api.github.com" + path, method=method,
+                  data=json.dumps(body).encode() if body else None,
+                  headers={"Authorization": "Bearer " + PAT, "User-Agent": "fargate-runner",
+                           "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code in ok:
+                      return None
+                  raise RuntimeError("GitHub %s %s -> %s %s" % (method, path, e.code, e.read()[:300]))
+
+          def handler(event, context):
+              for rec in event["Records"]:
+                  m = json.loads(rec["body"])
+                  job = gh("GET", "/repos/%s/actions/jobs/%s" % (m["repo"], m["job_id"]), ok=(404,))
+                  if not job or job["status"] != "queued":
+                      print("skip job", m["job_id"])
+                      continue
+                  running = sum(len(p["taskArns"]) for p in ecs.get_paginator("list_tasks").paginate(
+                      cluster=E["CLUSTER"], desiredStatus="RUNNING"))
+                  if running >= int(E["MAX_RUNNERS"]):
+                      raise RuntimeError("at MAX_RUNNERS (%d), retry later" % running)
+                  base = "/repos/%s/%s" % (E["OWNER"], E["REPO"]) if E["REPO"] else "/orgs/" + E["OWNER"]
+                  jit = gh("POST", base + "/actions/runners/generate-jitconfig", {
+                      "name": "fargate-%s-%s" % (m["job_id"], context.aws_request_id[:8]),
+                      "runner_group_id": int(E["RUNNER_GROUP_ID"]),
+                      "labels": [x.strip() for x in E["RUNNER_LABELS"].split(",")]})
+                  r = ecs.run_task(
+                      cluster=E["CLUSTER"], taskDefinition=E["TASK_DEFINITION"], count=1,
+                      startedBy="job-%s" % m["job_id"],
+                      capacityProviderStrategy=[{"capacityProvider": E["CAPACITY_PROVIDER"], "weight": 1}],
+                      networkConfiguration={"awsvpcConfiguration": {
+                          "subnets": E["SUBNETS"].split(","), "securityGroups": [E["SECURITY_GROUP"]],
+                          "assignPublicIp": E["ASSIGN_PUBLIC_IP"]}},
+                      overrides={"containerOverrides": [{"name": "runner", "environment": [
+                          {"name": "RUNNER_JIT_CONFIG", "value": jit["encoded_jit_config"]}]}]})
+                  if r["failures"]:
+                      raise RuntimeError("run_task failed: %s" % r["failures"])
+                  print("started", r["tasks"][0]["taskArn"], "for job", m["job_id"])
+
+  ScaleUpEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ScaleUpFunction
+      EventSourceArn: !GetAtt JobQueue.Arn
+      BatchSize: 1
+      Enabled: true
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  WebhookUrl:
+    Description: Payload URL for the GitHub webhook (content type application/json, event "Workflow jobs").
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+
+  WebhookSecretCommand:
+    Description: Command that prints the value to enter as the GitHub webhook "Secret".
+    Value: !Sub "aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${WebhookSecret} --query SecretString --output text"
+
+  RunnerRepositoryUri:
+    Condition: UseDefaultImage
+    Description: ECR repository to push the runner image to (tag latest).
+    Value: !GetAtt RunnerRepository.RepositoryUri
+
+  RunsOn:
+    Description: Value to use for runs-on in workflows.
+    Value: !Sub
+      - "[self-hosted, linux, ${Arch}, ${RunnerLabels}]"
+      - Arch: !If [IsArm, arm64, x64]
+
+  ClusterName:
+    Description: ECS cluster the runner tasks run in.
+    Value: !Ref Cluster
+
+  JobQueueUrl:
+    Description: SQS queue buffering queued jobs.
+    Value: !Ref JobQueue
+
+  DeadLetterQueueUrl:
+    Description: Jobs that could not be started land here after repeated failures.
+    Value: !Ref JobDeadLetterQueue
