@@ -609,6 +609,87 @@ Resources:
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/aws --version
 
+  # Automation runbooks that let developers start, stop and restart a dev
+  # server from Systems Manager > Automation > Execute. No AssumeRole is set,
+  # so they run with the caller's own permissions: the CloudDev permission
+  # set only allows EC2 start/stop/reboot on instances tagged with this
+  # environment, so these cannot touch anything else.
+  StartDevServerRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      # No Fn::Sub: {{InstanceId}} is an Automation parameter and must reach
+      # the deployed document literally.
+      Content:
+        schemaVersion: "0.3"
+        description: >-
+          Start a stopped CloudDev dev server and wait until it is running.
+        parameters:
+          InstanceId:
+            type: String
+            description: Dev server instance to act on.
+            allowedPattern: ^i-[0-9a-f]{8,17}$
+        mainSteps:
+          - name: changeState
+            action: aws:changeInstanceState
+            inputs:
+              InstanceIds:
+                - "{{InstanceId}}"
+              DesiredState: running
+
+  # Stops a dev server (EBS data is kept; compute billing pauses).
+  StopDevServerRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      # No Fn::Sub: {{InstanceId}} is an Automation parameter and must reach
+      # the deployed document literally.
+      Content:
+        schemaVersion: "0.3"
+        description: >-
+          Stop a running CloudDev dev server and wait until it is stopped.
+        parameters:
+          InstanceId:
+            type: String
+            description: Dev server instance to act on.
+            allowedPattern: ^i-[0-9a-f]{8,17}$
+        mainSteps:
+          - name: changeState
+            action: aws:changeInstanceState
+            inputs:
+              InstanceIds:
+                - "{{InstanceId}}"
+              DesiredState: stopped
+
+  # Reboots a dev server in place (same host, same public IP if any).
+  RestartDevServerRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      # No Fn::Sub: {{InstanceId}} is an Automation parameter and must reach
+      # the deployed document literally.
+      Content:
+        schemaVersion: "0.3"
+        description: >-
+          Reboot a CloudDev dev server in place.
+        parameters:
+          InstanceId:
+            type: String
+            description: Dev server instance to act on.
+            allowedPattern: ^i-[0-9a-f]{8,17}$
+        mainSteps:
+          - name: reboot
+            action: aws:executeAwsApi
+            inputs:
+              Service: ec2
+              Api: RebootInstances
+              InstanceIds:
+                - "{{InstanceId}}"
+
+
   # Tag-targeted SSM State Manager association that applies the Node config
   # document to every dev server tagged CloudDevNodeConfig=enabled. Lives in
   # this stack beside the document and references it with !Ref (NO
@@ -970,6 +1051,17 @@ Resources:
 # Outputs
 # ---------------------------------------------------------------------------
 Outputs:
+  StartDevServerRunbookName:
+    Description: Name of the Automation runbook that starts a dev server.
+    Value: !Ref StartDevServerRunbook
+
+  StopDevServerRunbookName:
+    Description: Name of the Automation runbook that stops a dev server.
+    Value: !Ref StopDevServerRunbook
+
+  RestartDevServerRunbookName:
+    Description: Name of the Automation runbook that reboots a dev server.
+    Value: !Ref RestartDevServerRunbook
   DevServerRoleArn:
     Description: ARN of the shared SSM-managed IAM role.
     Value: !GetAtt DevServerRole.Arn

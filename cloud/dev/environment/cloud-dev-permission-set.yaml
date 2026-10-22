@@ -159,6 +159,23 @@ Resources:
               - ssm:ListInstanceAssociations
             Resource: "*"
 
+          # Run and follow the environment's start/stop/restart Automation
+          # runbooks. They run as the caller, so the tag-scoped EC2
+          # permissions above still decide which instances can be touched.
+          - Sid: RunEnvironmentRunbooks
+            Effect: Allow
+            Action: ssm:StartAutomationExecution
+            Resource: !Sub "arn:aws:ssm:*:*:automation-definition/${EnvironmentStackName}-*:*"
+
+          - Sid: FollowAutomationExecutions
+            Effect: Allow
+            Action:
+              - ssm:DescribeAutomationExecutions
+              - ssm:DescribeAutomationStepExecutions
+              - ssm:GetAutomationExecution
+              - ssm:StopAutomationExecution
+            Resource: "*"
+
           # Look up the document names from the environment stack's outputs.
           - Sid: ReadEnvironmentStack
             Effect: Allow
