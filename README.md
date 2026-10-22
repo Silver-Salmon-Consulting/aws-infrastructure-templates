@@ -21,6 +21,7 @@ cloud/dev/
   server/
     cloud-dev-server-amazon-linux.yaml      # x86_64 (AMD) dev server
     cloud-dev-server-amazon-linux-arm.yaml  # arm64 (Graviton) dev server
+    cloud-dev-ollama-server.yaml            # private GPU Ollama LLM server
 ```
 
 ### Architecture
@@ -216,6 +217,47 @@ aws cloudformation deploy   --template-file cloud/dev/environment/cloud-dev-perm
   instance.
 - Documents are matched by CloudFormation's `<EnvironmentStackName>-*` naming,
   so only that environment's documents can be sent.
+
+## Private Ollama LLM server
+
+`cloud/dev/server/cloud-dev-ollama-server.yaml` runs [Ollama](https://ollama.com)
+on a GPU instance (default `g6.xlarge`, 24 GB VRAM; Deep Learning Base AMI on
+Amazon Linux 2023) so dev servers can use an open-source model from the shell
+or an editor. It reuses the environment stack's instance profile (Session
+Manager, no SSH) and the same idle auto-stop alarm as the dev servers.
+
+Ollama has no authentication, so access is controlled by security groups. The
+stack creates an empty **Ollama client security group** and allows TCP 11434
+from it only. Attach that group to any dev server in the same VPC to grant
+access.
+
+```bash
+# 1. Deploy the Ollama server (same VPC as your dev servers)
+aws cloudformation deploy   --template-file cloud/dev/server/cloud-dev-ollama-server.yaml   --stack-name CloudDevOllama   --parameter-overrides       VpcId=<vpc-id> SubnetId=<subnet-id>       OllamaModel=qwen2.5-coder:14b
+
+# 2. Read the client security group and endpoint outputs
+aws cloudformation describe-stacks --stack-name CloudDevOllama   --query "Stacks[0].Outputs"
+
+# 3. Update each dev server stack, passing the client group
+#    (an in-place change; the instance is not replaced)
+#    OllamaClientSecurityGroupId=<sg-...>
+```
+
+From a dev server:
+
+```bash
+export OLLAMA_HOST=http://<private-ip>:11434            # ollama CLI
+export OPENAI_BASE_URL=http://<private-ip>:11434/v1 OPENAI_API_KEY=ollama   # OpenAI-compatible tools
+```
+
+Notes:
+
+- GPU instances are costly (a `g6.xlarge` is roughly $0.80/hour on demand), so
+  keep idle auto-stop on. A stopped instance still pays for its EBS volume.
+- New accounts often have a zero quota for "Running On-Demand G and VT
+  instances"; request an increase before the first deploy.
+- The model pull at boot is best-effort. Pull more models later with
+  `ollama pull` over Session Manager.
 
 ## Connecting
 

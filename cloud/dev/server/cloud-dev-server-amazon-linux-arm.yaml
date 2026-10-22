@@ -17,6 +17,7 @@ Metadata:
           default: Shared environment (from CloudDev environment stack)
         Parameters:
           - EnvironmentStackName
+          - OllamaClientSecurityGroupId
       - Label:
           default: Idle auto-stop safeguard
         Parameters:
@@ -36,6 +37,8 @@ Metadata:
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
+      OllamaClientSecurityGroupId:
+        default: Ollama client security group (optional)
       EnableIdleShutdown:
         default: Enable idle auto-stop
       IdleCpuThresholdPercent:
@@ -94,6 +97,16 @@ Parameters:
       - m6g.xlarge
       - c6g.large
       - c6g.xlarge
+
+  OllamaClientSecurityGroupId:
+    Type: String
+    Description: >-
+      Optional. The OllamaClientSecurityGroupId output of a CloudDev Ollama
+      server stack. When set, it is attached to this server so it can reach
+      Ollama on TCP 11434. Leave empty to skip.
+    Default: ""
+    AllowedPattern: ^(sg-[0-9a-f]{8,17})?$
+    ConstraintDescription: Must be empty or a security group ID, e.g. sg-0123456789abcdef0.
 
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
@@ -241,6 +254,7 @@ Parameters:
 # Conditions
 # ---------------------------------------------------------------------------
 Conditions:
+  AttachOllamaClientSg: !Not [!Equals [!Ref OllamaClientSecurityGroupId, ""]]
   IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
   PowerShellEnabled: !Equals [!Ref EnablePowerShell, "true"]
   PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
@@ -281,6 +295,7 @@ Resources:
       SubnetId: !Ref SubnetId
       SecurityGroupIds:
         - !GetAtt DevServerSecurityGroup.GroupId
+        - !If [AttachOllamaClientSg, !Ref OllamaClientSecurityGroupId, !Ref AWS::NoValue]
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:

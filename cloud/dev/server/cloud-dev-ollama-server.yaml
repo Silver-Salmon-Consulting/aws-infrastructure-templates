@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Private Ollama LLM server. Provisions a single GPU EC2 instance (Amazon Linux
+  2023, Deep Learning Base AMI with NVIDIA drivers) running Ollama, with a
+  security group that allows the Ollama API (TCP 11434) only from a dedicated
+  client security group, which you attach to your dev servers. Ollama has no authentication, so the security group
+  is the access control.
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Shared environment (from CloudDev environment stack)
+        Parameters:
+          - EnvironmentStackName
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: Server
+        Parameters:
+          - InstanceType
+          - VolumeSize
+          - LatestAmiId
+      - Label:
+          default: Ollama
+        Parameters:
+          - OllamaModel
+          - OllamaKeepAlive
+      - Label:
+          default: Idle auto-stop safeguard
+        Parameters:
+          - EnableIdleShutdown
+          - IdleCpuThresholdPercent
+          - IdleStopPeriods
+    ParameterLabels:
+      EnvironmentStackName:
+        default: CloudDev environment stack name
+      OllamaModel:
+        default: Model to pull at first boot
+      OllamaKeepAlive:
+        default: Model keep-alive in GPU memory
+      EnableIdleShutdown:
+        default: Enable idle auto-stop
+      IdleCpuThresholdPercent:
+        default: Idle CPU threshold (%)
+      IdleStopPeriods:
+        default: Idle 5-min periods before stop
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentStackName:
+    Type: String
+    Description: >-
+      Name of the deployed CloudDev environment stack. The IAM instance
+      profile and bootstrap CloudWatch log group are imported from its exported
+      outputs (via Fn::ImportValue).
+    Default: CloudDevEnv
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing both this server and your dev servers.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Subnet (within the chosen VPC) to launch into. It needs outbound internet
+      access (public subnet or NAT) to download Ollama and model weights. The
+      server is not reachable from the internet either way; only the client
+      security group can connect.
+
+  InstanceType:
+    Type: String
+    Description: >-
+      GPU instance size. VRAM decides which models fit: g5.xlarge/g6.xlarge
+      have 24 GB (up to ~14B models comfortably, ~30B quantized with a small
+      context), g6e.xlarge has 48 GB (30B-class models), g5.12xlarge has 96 GB.
+    Default: g6.xlarge
+    AllowedValues:
+      - g5.xlarge
+      - g5.2xlarge
+      - g5.4xlarge
+      - g5.12xlarge
+      - g6.xlarge
+      - g6.2xlarge
+      - g6e.xlarge
+      - g6e.2xlarge
+      - g6e.12xlarge
+
+  VolumeSize:
+    Type: Number
+    Description: Root EBS volume size in GiB. Model weights are large (10-50 GB each).
+    Default: 200
+    MinValue: 100
+    MaxValue: 2000
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: >-
+      SSM parameter resolving to the latest Deep Learning Base OSS Nvidia
+      Driver GPU AMI (Amazon Linux 2023). It ships with NVIDIA drivers, which
+      Ollama needs to use the GPU.
+    Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-amazonlinux-2023/latest/ami-id
+
+  OllamaModel:
+    Type: String
+    Description: >-
+      Ollama model tag pulled on first boot (see https://ollama.com/library).
+      Leave empty to pull nothing and run `ollama pull` yourself later. More can
+      be pulled at any time.
+    Default: qwen2.5-coder:14b
+
+  OllamaKeepAlive:
+    Type: String
+    Description: >-
+      How long Ollama keeps a model loaded after the last request (e.g. 30m,
+      24h, -1 for forever). Cold loads of large models take a while.
+    Default: 1h
+
+  EnableIdleShutdown:
+    Type: String
+    Description: >-
+      Create a CloudWatch alarm that STOPS (not terminates) the instance when
+      it has seen no meaningful network traffic for the configured window.
+      GPU instances are expensive; this guards against a forgotten server.
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  IdleCpuThresholdPercent:
+    Type: Number
+    Description: >-
+      Average CPUUtilization (percent) below which the instance counts as idle.
+      Inference traffic shows up as network traffic, so the alarm also requires
+      near-zero network in/out. Only used when EnableIdleShutdown is true.
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+
+  IdleStopPeriods:
+    Type: Number
+    Description: >-
+      Consecutive 5-minute idle periods before the instance is stopped
+      (e.g. 6 = 30 minutes). Only used when EnableIdleShutdown is true.
+    Default: 6
+    MinValue: 1
+    MaxValue: 288
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+  # Empty "client" group: it has no rules of its own. Attaching it to a dev
+  # server (via that stack's OllamaClientSecurityGroupId parameter) is what
+  # grants access to Ollama, since the server group below allows this group.
+  OllamaClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Attach to dev servers that may call the ${AWS::StackName} Ollama server."
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-client-sg"
+
+  OllamaServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Ollama API access for ${AWS::StackName}, only from the Ollama client security group."
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 11434
+          ToPort: 11434
+          SourceSecurityGroupId: !GetAtt OllamaClientSecurityGroup.GroupId
+          Description: Ollama API from members of the client security group.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (Ollama install and model downloads).
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  OllamaServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile:
+        Fn::ImportValue: !Sub "${EnvironmentStackName}-DevServerInstanceProfileName"
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt OllamaServerSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ollama-server"
+        # Scopes the CloudDev permission set's start/stop and SSM access to
+        # this instance, the same as the dev servers.
+        - Key: CloudDevEnvironment
+          Value: !Ref EnvironmentStackName
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+
+              # Signal CloudFormation via the AWS CLI (see the dev server
+              # templates for why not cfn-signal). The trap is set first so any
+              # failure reports FAILURE instead of waiting out the timeout.
+              REGION="${AWS::Region}"
+              TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+                http://169.254.169.254/latest/meta-data/instance-id)
+
+              signal_cfn() {
+                local status="$1"
+                aws cloudformation signal-resource \
+                  --stack-name "${AWS::StackName}" \
+                  --logical-resource-id OllamaServerInstance \
+                  --unique-id "$INSTANCE_ID" \
+                  --status "$status" \
+                  --region "$REGION" || true
+              }
+              trap '[ $? -eq 0 ] && signal_cfn SUCCESS || signal_cfn FAILURE' EXIT
+
+              export HOME=/root
+
+              # Best-effort CloudWatch agent so this script's output streams to
+              # CloudWatch Logs. Never a health dependency.
+              (
+                set -x
+                dnf install -y amazon-cloudwatch-agent
+                cat > /opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json <<'CWCONFIG'
+              {
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/var/log/cloud-init-output.log",
+                          "log_group_name": "${BootstrapLogGroupName}",
+                          "log_stream_name": "{instance_id}/cloud-init-output"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+              CWCONFIG
+                /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                  -a fetch-config -m ec2 -s \
+                  -c file:/opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json
+              ) || echo "WARNING: CloudWatch agent setup failed; continuing."
+
+              # The Deep Learning AMI already has the NVIDIA driver; fail fast
+              # if the GPU is not visible rather than silently running on CPU.
+              nvidia-smi
+
+              curl -fsSL https://ollama.com/install.sh | sh
+
+              # Listen on all interfaces; the security group restricts who can
+              # connect. Ollama has no authentication of its own.
+              mkdir -p /etc/systemd/system/ollama.service.d
+              cat > /etc/systemd/system/ollama.service.d/override.conf <<'OVERRIDE'
+              [Service]
+              Environment="OLLAMA_HOST=0.0.0.0:11434"
+              Environment="OLLAMA_KEEP_ALIVE=${OllamaKeepAlive}"
+              OVERRIDE
+              systemctl daemon-reload
+              systemctl enable ollama
+              systemctl restart ollama
+
+              for i in $(seq 1 30); do
+                curl -sf http://127.0.0.1:11434/api/version && break
+                sleep 2
+              done
+
+              # Model pull is best-effort: a bad tag or flaky download should
+              # not fail the stack. Re-run `ollama pull` via Session Manager.
+              MODEL="${OllamaModel}"
+              if [ -n "$MODEL" ]; then
+                ollama pull "$MODEL" || echo "WARNING: ollama pull $MODEL failed; pull it manually."
+              fi
+            - BootstrapLogGroupName:
+                Fn::ImportValue: !Sub "${EnvironmentStackName}-BootstrapLogGroupName"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+
+  # Cost safeguard: stop (not terminate) the instance after IdleStopPeriods
+  # consecutive 5-minute periods with low CPU and under ~5 MB of combined
+  # network traffic. Idle SSM/CloudWatch chatter is well under that; a prompt
+  # and its response are small, but model downloads and active sessions are
+  # not, and CPU rises while a model loads. Same metric-math pattern as the
+  # dev server templates; uses the built-in EC2 stop alarm action.
+  IdleShutdownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IdleShutdownEnabled
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-idle-shutdown"
+      AlarmDescription: !Sub >-
+        Stops ${AWS::StackName} when CPU is below ${IdleCpuThresholdPercent}%
+        and network traffic is below 5 MB per period for ${IdleStopPeriods}
+        consecutive 5-minute periods.
+      Metrics:
+        - Id: idle
+          Expression: !Sub "IF(cpu < ${IdleCpuThresholdPercent} AND (netin + netout) / 1048576 < 5, 1, 0)"
+          Label: Idle (1 = idle)
+          ReturnData: true
+        - Id: cpu
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: CPUUtilization
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref OllamaServerInstance
+            Period: 300
+            Stat: Average
+        - Id: netin
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: NetworkIn
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref OllamaServerInstance
+            Period: 300
+            Stat: Sum
+        - Id: netout
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: NetworkOut
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref OllamaServerInstance
+            Period: 300
+            Stat: Sum
+      EvaluationPeriods: !Ref IdleStopPeriods
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:stop"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  OllamaClientSecurityGroupId:
+    Description: >-
+      Pass this as OllamaClientSecurityGroupId when creating or updating a dev
+      server stack to let it reach Ollama.
+    Value: !GetAtt OllamaClientSecurityGroup.GroupId
+
+  InstanceId:
+    Description: ID of the Ollama server EC2 instance.
+    Value: !Ref OllamaServerInstance
+
+  # The private IP is stable across stop/start for the life of the instance,
+  # so it is safe to surface (unlike a public IP).
+  OllamaHost:
+    Description: >-
+      Set this as OLLAMA_HOST on a dev server (or use it as the base URL
+      with /v1 appended for OpenAI-compatible clients).
+    Value: !Sub "http://${OllamaServerInstance.PrivateIp}:11434"
+
+  OpenAiBaseUrl:
+    Description: OpenAI-compatible base URL (set OPENAI_BASE_URL; any API key value works).
+    Value: !Sub "http://${OllamaServerInstance.PrivateIp}:11434/v1"
+
+  SessionManagerCommand:
+    Description: Connect to the Ollama server via AWS Systems Manager Session Manager.
+    Value: !Sub "aws ssm start-session --target ${OllamaServerInstance} --region ${AWS::Region}"
