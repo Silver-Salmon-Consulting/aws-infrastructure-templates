@@ -22,6 +22,7 @@ Metadata:
         Parameters:
           - EnableIdleShutdown
           - IdleCpuThresholdPercent
+          - IdleNetworkThresholdMB
           - IdleStopPeriods
       - Label:
           default: Software (installed via shared SSM documents)
@@ -39,6 +40,8 @@ Metadata:
         default: Enable idle auto-stop
       IdleCpuThresholdPercent:
         default: Idle CPU threshold (%)
+      IdleNetworkThresholdMB:
+        default: Idle network threshold (MB per 5 min)
       IdleStopPeriods:
         default: Idle 5-min periods before stop
       EnablePowerShell:
@@ -126,7 +129,8 @@ Parameters:
     Type: String
     Description: >-
       Create a CloudWatch alarm that STOPS (not terminates) the instance when
-      CPU stays below the idle threshold for the configured window. A cost
+      CPU and network traffic both stay below the idle thresholds for the
+      configured window. A cost
       safeguard for a forgotten-running dev box.
     Default: "true"
     AllowedValues:
@@ -141,6 +145,18 @@ Parameters:
     Default: 5
     MinValue: 1
     MaxValue: 100
+
+  IdleNetworkThresholdMB:
+    Type: Number
+    Description: >-
+      Combined NetworkIn + NetworkOut (megabytes per 5-minute period) below
+      which the instance is considered idle. Both this AND the CPU threshold
+      must be met for a period to count as idle, so background CPU noise
+      alone no longer keeps a quiet box running (and a busy download does not
+      get it stopped). Only used when EnableIdleShutdown is true.
+    Default: 5
+    MinValue: 0.1
+    MaxValue: 10000
 
   IdleStopPeriods:
     Type: Number
@@ -390,35 +406,67 @@ Resources:
       ResourceSignal:
         Timeout: PT15M
 
-  # Cost safeguard: stop (not terminate) the instance when average CPU stays
-  # below IdleCpuThresholdPercent for IdleStopPeriods consecutive 5-minute
-  # periods. Uses the built-in EC2 'stop' alarm action (arn:aws:automate:
-  # ...:ec2:stop) — no Lambda, script, or IAM role required. Period is 300s to
-  # match EC2 basic monitoring's 5-minute CPUUtilization resolution (a shorter
-  # period would mostly see missing data and behave erratically). TreatMissing
-  # Data is notBreaching so a gap in metrics never triggers a stop. Created
-  # only when EnableIdleShutdown=true.
+  # Cost safeguard: stop (not terminate) the instance when a 5-minute period
+  # is "idle" (average CPU below IdleCpuThresholdPercent AND NetworkIn +
+  # NetworkOut below IdleNetworkThresholdMB) for IdleStopPeriods consecutive
+  # periods. CPU alone was too easily held above the threshold by background
+  # agents, so the box never stopped. Metric math emits 1 for an idle period;
+  # the alarm fires when that stays >= 1. Every underlying metric carries the
+  # InstanceId dimension, which the built-in EC2 'stop' alarm action
+  # (arn:aws:automate:...:ec2:stop) requires; no Lambda or IAM role needed.
+  # Period is 300s to match EC2 basic monitoring. TreatMissingData is
+  # notBreaching so a gap in metrics never triggers a stop. Created only when
+  # EnableIdleShutdown=true.
   IdleShutdownAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: IdleShutdownEnabled
     Properties:
       AlarmName: !Sub "${AWS::StackName}-idle-shutdown"
       AlarmDescription: !Sub >-
-        Stops ${AWS::StackName} when average CPU is below
-        ${IdleCpuThresholdPercent}% for ${IdleStopPeriods} consecutive 5-minute
-        periods.
-      Namespace: AWS/EC2
-      MetricName: CPUUtilization
-      Dimensions:
-        - Name: InstanceId
-          Value: !Ref DevServerInstance
-      Statistic: Average
-      # EC2 basic monitoring emits CPUUtilization every 5 minutes, so the
-      # period must be 300s; IdleStopPeriods is the count of those periods.
-      Period: 300
+        Stops ${AWS::StackName} when CPU is below ${IdleCpuThresholdPercent}%
+        and network traffic is below ${IdleNetworkThresholdMB} MB per period
+        for ${IdleStopPeriods} consecutive 5-minute periods.
+      Metrics:
+        - Id: idle
+          Expression: !Sub "IF(cpu < ${IdleCpuThresholdPercent} AND (netin + netout) / 1048576 < ${IdleNetworkThresholdMB}, 1, 0)"
+          Label: Idle (1 = idle)
+          ReturnData: true
+        - Id: cpu
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: CPUUtilization
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref DevServerInstance
+            Period: 300
+            Stat: Average
+        - Id: netin
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: NetworkIn
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref DevServerInstance
+            Period: 300
+            Stat: Sum
+        - Id: netout
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: NetworkOut
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref DevServerInstance
+            Period: 300
+            Stat: Sum
       EvaluationPeriods: !Ref IdleStopPeriods
-      Threshold: !Ref IdleCpuThresholdPercent
-      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions:
         - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:stop"

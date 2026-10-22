@@ -241,11 +241,16 @@ instance when it is idle, as a cost guard against a forgotten-running box:
 
 - `EnableIdleShutdown` (default `true`)
 - `IdleCpuThresholdPercent` (default `5`) — CPU % below which it is "idle"
-- `IdleStopPeriods` (default `12`) — consecutive 5-minute periods below the
-  threshold before stopping (12 × 5 min = 60 minutes)
+- `IdleNetworkThresholdMB` (default `5`) — combined NetworkIn + NetworkOut
+  (MB per 5 minutes) below which it is "idle"
+- `IdleStopPeriods` (default `12`) — consecutive 5-minute periods that are idle
+  (CPU **and** network both below their thresholds) before stopping
+  (12 × 5 min = 60 minutes)
 
-The alarm uses a 300-second period to match EC2 basic monitoring's 5-minute
-`CPUUtilization` resolution. The instance stops (EBS persists; restart it later).
+The alarm is a metric-math alarm over `CPUUtilization`, `NetworkIn` and
+`NetworkOut`, using a 300-second period to match EC2 basic monitoring's
+5-minute resolution. Requiring both signals keeps background CPU noise from
+holding a quiet box up, and keeps a busy download from being stopped. The instance stops (EBS persists; restart it later).
 A truly idle box you are connected to will still stop after the window — raise
 `IdleStopPeriods` or set `EnableIdleShutdown=false` if that is a problem.
 
