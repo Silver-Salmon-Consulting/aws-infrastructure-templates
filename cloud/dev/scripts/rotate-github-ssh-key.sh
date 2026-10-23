@@ -16,7 +16,7 @@ set -euo pipefail
 
 INSTANCE="" KEEP=2 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" DOC="${DOC:-}" PROFILE_ARGS=()
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while getopts "i:k:r:p:d:h" opt; do
   case "$opt" in
