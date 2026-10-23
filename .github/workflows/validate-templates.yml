@@ -41,3 +41,28 @@ jobs:
           echo "Linting the following templates:"
           printf '  %s\n' "${templates[@]}"
           cfn-lint "${templates[@]}"
+
+      - name: Check the embedded rotate-github-key matches the repo script
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install pyyaml
+          python - <<'PY'
+          import sys, yaml
+
+          class Loader(yaml.SafeLoader):
+              pass
+
+          Loader.add_multi_constructor("!", lambda loader, suffix, node: None)
+
+          with open("cloud/dev/environment/cloud-dev-environment.yaml") as f:
+              template = yaml.load(f, Loader)
+          commands = template["Resources"]["AmazonLinuxGhCliV2Document"]["Properties"]["Content"]["mainSteps"][0]["inputs"]["runCommand"]
+          block = next(c for c in commands if "ROTATE_EOF" in c)
+          embedded = block.split("<<'ROTATE_EOF'\n", 1)[1].rsplit("ROTATE_EOF", 1)[0]
+          with open("cloud/dev/scripts/rotate-github-ssh-key.sh") as f:
+              repo = f.read()
+          if embedded != repo:
+              sys.exit("The rotate-github-key copy in the GitHub document differs from cloud/dev/scripts/rotate-github-ssh-key.sh")
+          print("embedded script matches the repo script")
+          PY

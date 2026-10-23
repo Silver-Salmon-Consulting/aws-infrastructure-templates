@@ -219,11 +219,14 @@ instance's output. To rotate every dev server in the environment at once, replac
 `--instance-ids "$INSTANCE"` with
 `--targets Key=tag:CloudDevEnvironment,Values=<value of the tag on your servers>`.
 
-**Shortcut script.** [cloud/dev/scripts/rotate-github-ssh-key.sh](cloud/dev/scripts/rotate-github-ssh-key.sh)
-does the lookup, send, wait and output in one command. By default it targets the
+**Shortcut script.** Servers with `GhCliMajorVersion=v2` get `rotate-github-key` in `/usr/local/bin`
+from the GitHub document's `Install` action at first boot (it is a copy of
+[cloud/dev/scripts/rotate-github-ssh-key.sh](cloud/dev/scripts/rotate-github-ssh-key.sh);
+CI checks the two match, so edit both together). It does the lookup, send, wait and output in one command. By default it targets the
 instance it runs on, finds the document by name and keeps 2 keys:
 
 ```bash
+# already installed on dev servers; elsewhere (e.g. a laptop):
 install -m 0755 cloud/dev/scripts/rotate-github-ssh-key.sh ~/.local/bin/rotate-github-key
 rotate-github-key                         # this server, using the server role
 rotate-github-key -i i-0123456789abcdef0  # another server (-r region, -k keep, -d document)
