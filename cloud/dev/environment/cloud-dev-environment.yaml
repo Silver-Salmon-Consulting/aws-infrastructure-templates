@@ -29,6 +29,7 @@ Metadata:
           default: Server software versions (fleet-wide, via SSM documents)
         Parameters:
           - DefaultNodeVersion
+          - DefaultNpmVersion
           - PowerShell74Version
           - PowerShell76Version
           - DotNet8Version
@@ -37,6 +38,7 @@ Metadata:
           - K6V0Version
           - K6V1Version
           - AwsCliV2Version
+          - GhCliV2Version
     ParameterLabels:
       StackNamePrefix:
         default: Stack name prefix
@@ -44,6 +46,8 @@ Metadata:
         default: Bootstrap log retention (days)
       DefaultNodeVersion:
         default: Default Node.js version
+      DefaultNpmVersion:
+        default: Default npm version
       PowerShell74Version:
         default: PowerShell 7.4 version
       PowerShell76Version:
@@ -60,6 +64,8 @@ Metadata:
         default: k6 1.x version
       AwsCliV2Version:
         default: AWS CLI 2.x version
+      GhCliV2Version:
+        default: GitHub CLI 2.x version
       VpcMode:
         default: VPC topology
       AzCount:
@@ -111,6 +117,18 @@ Parameters:
       - "22"
       - "24"
       - "26"
+
+  DefaultNpmVersion:
+    Type: String
+    Description: >-
+      Fleet-wide exact npm version. Baked into the Node config SSM document as
+      its NpmVersion parameter default and installed over the npm bundled with
+      Node. 12.2.1 is the latest release (as of October 2026); it supports
+      Node 22.22.2+, 24.15.0+ and 26+, so it works with every
+      DefaultNodeVersion choice.
+    Default: "12.2.1"
+    AllowedPattern: ^\d+\.\d+\.\d+$
+    ConstraintDescription: Must be an exact version, e.g. 12.2.1.
 
   # Exact, pinned versions for the versioned tool documents, so every dev
   # server gets the same release and rebuilds are reproducible. Nothing floats
@@ -190,6 +208,15 @@ Parameters:
     Default: "2.38.5"
     AllowedPattern: ^2\.\d+\.\d+$
     ConstraintDescription: Must be a 2.x.y version, e.g. 2.38.5.
+
+  GhCliV2Version:
+    Type: String
+    Description: >-
+      Exact GitHub CLI 2.x version installed by the GitHub CLI 2.x document.
+      2.103.0 is the latest 2.x release (as of October 2026).
+    Default: "2.103.0"
+    AllowedPattern: ^2\.\d+\.\d+$
+    ConstraintDescription: Must be a 2.x.y version, e.g. 2.103.0.
 
   VpcMode:
     Type: String
@@ -347,8 +374,9 @@ Resources:
             default: !Sub "${DefaultNodeVersion}"
           NpmVersion:
             type: String
-            description: npm version to install, or "latest" to keep the bundled one.
-            default: latest
+            description: Exact npm version to install over the one bundled with Node.
+            # Fleet-wide pin from the DefaultNpmVersion stack parameter.
+            default: !Sub "${DefaultNpmVersion}"
         mainSteps:
           - action: aws:runShellScript
             name: installNodeAndNpm
@@ -366,7 +394,7 @@ Resources:
                 - nvm install "{{NodeVersion}}"
                 - nvm alias default "{{NodeVersion}}"
                 - nvm use default
-                - if [ "{{NpmVersion}}" != "latest" ]; then npm install -g "npm@{{NpmVersion}}"; fi
+                - npm install -g "npm@{{NpmVersion}}"
                 - printf 'export NVM_DIR="/opt/nvm"\n[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\n' > /etc/profile.d/nvm.sh
                 - chmod +x /etc/profile.d/nvm.sh
                 - chown -R ec2-user:ec2-user /opt/nvm
@@ -778,6 +806,47 @@ Resources:
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/aws --version
 
+  # GitHub CLI 2.x from GitHub's release tarball (amd64/arm64 picked from
+  # uname) into /usr/local/bin/gh, pinned by GhCliVersion. git itself comes
+  # from dnf with the Node config document.
+  AmazonLinuxGhCliV2Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{GhCliVersion}} is an SSM document parameter
+      # and must reach the deployed document literally.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install the GitHub CLI 2.x into /usr/local/bin/gh from GitHub's
+          release tarball. Works on x86_64 and arm64 Amazon Linux.
+        parameters:
+          GhCliVersion:
+            type: String
+            description: >-
+              Exact GitHub CLI 2.x version to install (e.g. 2.103.0).
+            allowedPattern: ^2\.\d+\.\d+$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installGhCli
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - GH_VERSION="{{GhCliVersion}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  GH_ARCH="amd64" ;;
+                    aarch64) GH_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y tar gzip
+                - TMP_DIR=$(mktemp -d)
+                - curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$TMP_DIR"
+                - install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
+                - rm -rf "$TMP_DIR"
+                - /usr/local/bin/gh --version
+
   # Automation runbooks that let developers start, stop and restart a dev
   # server from Systems Manager > Automation > Execute. No AssumeRole is set,
   # so they run with the caller's own permissions: the CloudDev permission
@@ -1004,6 +1073,19 @@ Resources:
           - !Ref AwsCliV2Version
       Targets:
         - Key: "tag:CloudDevAwsCliConfig"
+          Values:
+            - v2
+
+  GhCliV2ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-ghcli-v2"
+      Name: !Ref AmazonLinuxGhCliV2Document
+      Parameters:
+        GhCliVersion:
+          - !Ref GhCliV2Version
+      Targets:
+        - Key: "tag:CloudDevGhCliConfig"
           Values:
             - v2
 
@@ -1373,6 +1455,14 @@ Outputs:
     Value: !Ref AmazonLinuxAwsCliV2Document
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxAwsCliV2DocumentName"
+
+  AmazonLinuxGhCliV2DocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs the GitHub CLI 2.x
+      (GhCliVersion parameter) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxGhCliV2Document
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxGhCliV2DocumentName"
 
   VpcId:
     Condition: CreateVpc

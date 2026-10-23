@@ -33,6 +33,7 @@ Metadata:
           - DotNetVersion
           - K6MajorVersion
           - AwsCliMajorVersion
+          - GhCliMajorVersion
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
@@ -56,6 +57,8 @@ Metadata:
         default: k6 major version
       AwsCliMajorVersion:
         default: AWS CLI (official installer) major version
+      GhCliMajorVersion:
+        default: GitHub CLI major version
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -242,6 +245,16 @@ Parameters:
       - none
       - v2
 
+  GhCliMajorVersion:
+    Type: String
+    Description: >-
+      Install the GitHub CLI (/usr/local/bin/gh) at the environment stack's
+      pinned release in this major version, or "none" to skip it.
+    Default: none
+    AllowedValues:
+      - none
+      - v2
+
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
@@ -325,6 +338,8 @@ Resources:
           Value: !Ref K6MajorVersion
         - Key: CloudDevAwsCliConfig
           Value: !Ref AwsCliMajorVersion
+        - Key: CloudDevGhCliConfig
+          Value: !Ref GhCliMajorVersion
       UserData:
         Fn::Base64:
           Fn::Sub:

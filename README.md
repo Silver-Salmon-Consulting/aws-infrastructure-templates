@@ -37,7 +37,7 @@ cloud/dev/
     installs the system libraries/fonts and Chromium build Playwright needs
     (takes a `PlaywrightVersion`), one installs jq/zip/unzip, and the rest are
     per-version tool documents (PowerShell 7.4 and 7.6, .NET 8 and 10, k6 0.x
-    and 1.x, AWS CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
+    and 1.x, AWS CLI 2.x, GitHub CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
   - **tag-targeted** SSM State Manager associations that apply those
     documents to any instance carrying the matching tag;
   - an optional VPC (`public` or `public-private`, 1–3 AZs).
@@ -72,6 +72,7 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `K6V0ConfigAssociation` / `K6V1ConfigAssociation` target
      `tag:CloudDevK6Config = v0` / `v1`
    - `AwsCliV2ConfigAssociation` targets `tag:CloudDevAwsCliConfig = v2`
+   - `GhCliV2ConfigAssociation` targets `tag:CloudDevGhCliConfig = v2`
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
    - `CloudDevPowerShellConfig = <PowerShellVersion>` (`none` / `v7.4` / `v7.6`,
@@ -83,6 +84,7 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `CloudDevBaseToolsConfig = enabled` (always — jq, zip and unzip)
    - `CloudDevK6Config = <K6MajorVersion>` (`none` / `v0` / `v1`, default `none`)
    - `CloudDevAwsCliConfig = <AwsCliMajorVersion>` (`none` / `v2`, default `none`)
+   - `CloudDevGhCliConfig = <GhCliMajorVersion>` (`none` / `v2`, default `none`)
 
 The .NET SDK installs into `/opt/dotnet` (via Microsoft's `dotnet-install.sh`,
 x64 or arm64 automatically), with `/usr/bin/dotnet` symlinked and `DOTNET_ROOT`
@@ -100,14 +102,14 @@ Playwright's WebKit and Firefox builds target Ubuntu.
 
 ### Versioned tool documents
 
-Tools whose version matters to a project (PowerShell, .NET, k6, the AWS CLI)
+Tools whose version matters to a project (PowerShell, .NET, k6, the AWS CLI, the GitHub CLI)
 follow one pattern: **one SSM document per tool per major version** (PowerShell:
 per release line), for example `AmazonLinuxK6V0Document` and
 `AmazonLinuxK6V1Document`. Nothing floats to `latest`: every document takes an
 **exact version** with no default of its own, and the association passes it in
 from a pinned environment-stack parameter (`PowerShell74Version`,
 `PowerShell76Version`, `DotNet8Version`, `DotNet10Version`, `K6V0Version`,
-`K6V1Version`, `AwsCliV2Version`).
+`K6V1Version`, `AwsCliV2Version`, `GhCliV2Version`).
 
 - The document fixes the major version. Its version parameter (`PowerShellVersion`,
   `DotNetVersion`, `K6Version`, `AwsCliVersion`) takes an exact version
@@ -115,7 +117,7 @@ from a pinned environment-stack parameter (`PowerShell74Version`,
 - Each major has its own association. All majors of a tool share one tag key
   and differ by tag **value**, so a server selects exactly one major
   (`CloudDevK6Config = v0`), and `none` selects nothing. Server stacks expose
-  this as `K6MajorVersion` / `AwsCliMajorVersion`.
+  this as `K6MajorVersion` / `AwsCliMajorVersion` / `GhCliMajorVersion`.
 - To add a major, copy the document and association, change the major number,
   and add the value to the server stacks' `AllowedValues`.
 - To roll the fleet to a new release, change the pinned parameter on the
@@ -152,10 +154,12 @@ defaults (current as of October 2026), so every server gets the same release:
 - `PowerShell74Version` (`7.4.21`), `PowerShell76Version` (`7.6.8`, LTS)
 - `DotNet8Version` (`8.0.426`), `DotNet10Version` (`10.0.402`)
 - `PlaywrightVersion` (`1.64.1`)
-- `K6V0Version` (`0.59.0`), `K6V1Version` (`1.8.2`), `AwsCliV2Version` (`2.38.5`)
+- `K6V0Version` (`0.59.0`), `K6V1Version` (`1.8.2`), `AwsCliV2Version` (`2.38.5`),
+  `GhCliV2Version` (`2.103.0`)
+- `DefaultNpmVersion` (`12.2.1`) — exact npm, installed over Node's bundled one
 
 Servers only choose *which* line to install (`PowerShellVersion`,
-`DotNetVersion`, `K6MajorVersion`, `AwsCliMajorVersion` dropdowns); the exact
+`DotNetVersion`, `K6MajorVersion`, `AwsCliMajorVersion`, `GhCliMajorVersion` dropdowns); the exact
 release is fleet-wide.
 
 Server stacks do not take an exact version. Changing the fleet version means
@@ -327,6 +331,8 @@ A truly idle box you are connected to will still stop after the window — raise
 | `K6V0Version` | `0.59.0` | Exact k6 0.x release |
 | `K6V1Version` | `1.8.2` | Exact k6 1.x release |
 | `AwsCliV2Version` | `2.38.5` | Exact AWS CLI 2.x release |
+| `GhCliV2Version` | `2.103.0` | Exact GitHub CLI 2.x release |
+| `DefaultNpmVersion` | `12.2.1` | Exact npm version |
 | `VpcMode` | `none` | `none` / `public` / `public-private` |
 | `AzCount` | `1` | Availability Zones (1–3) when a VPC is created |
 | `VpcCidr` | `10.0.0.0/16` | VPC CIDR when a VPC is created |
