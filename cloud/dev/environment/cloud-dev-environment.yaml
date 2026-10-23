@@ -1061,7 +1061,7 @@ Resources:
                 - chmod 600 /home/ec2-user/.aws/credentials
 
   # GitHub document: installs the GitHub CLI 2.x AND rotates the GitHub SSH
-  # key, selected by the Action parameter (steps are skipped by precondition).
+  # key, selected by the Action parameter (one script that branches on it).
   #  - Install (default): GitHub CLI from GitHub's release tarball
   #    (amd64/arm64 picked from uname) into /usr/local/bin/gh, pinned by
   #    GhCliVersion. This is what the association runs at launch. git itself
@@ -1112,78 +1112,68 @@ Resources:
             allowedPattern: ^[1-9]$
         mainSteps:
           - action: aws:runShellScript
-            name: installGhCli
-            precondition:
-              StringEquals:
-                - "{{Action}}"
-                - Install
+            name: githubSetup
             inputs:
+              # One script that branches on Action. (Document-level
+              # preconditions were not used: they cannot reliably gate steps
+              # on a document parameter.)
               runCommand:
-                - set -euo pipefail
-                - GH_VERSION="{{GhCliVersion}}"
-                - '[ -n "$GH_VERSION" ] || { echo "GhCliVersion is required for Action=Install" >&2; exit 1; }'
                 - |
-                  case "$(uname -m)" in
-                    x86_64)  GH_ARCH="amd64" ;;
-                    aarch64) GH_ARCH="arm64" ;;
-                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-                  esac
-                - dnf install -y tar gzip
-                - TMP_DIR=$(mktemp -d)
-                - curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$TMP_DIR"
-                - install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
-                - rm -rf "$TMP_DIR"
-                - /usr/local/bin/gh --version
-          - action: aws:runShellScript
-            name: rotateGitHubSshKey
-            precondition:
-              StringEquals:
-                - "{{Action}}"
-                - RotateSshKey
-            inputs:
-              runCommand:
-                - set -euo pipefail
-                - KEEP="{{KeepKeys}}"
-                - USER_NAME=ec2-user
-                - SSH_DIR="/home/$USER_NAME/.ssh"
-                - KEY_DIR="$SSH_DIR/github"
-                - mkdir -p "$KEY_DIR"
-                - chmod 700 "$SSH_DIR" "$KEY_DIR"
-                - TOKEN=$(curl -sS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds:60" http://169.254.169.254/latest/api/token)
-                - INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-                - STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-                - TITLE="$INSTANCE_ID-$STAMP"
-                - NEW_KEY="$KEY_DIR/id_ed25519_$STAMP"
-                - ssh-keygen -q -t ed25519 -N "" -C "$TITLE" -f "$NEW_KEY"
-                # Make the new key the active one. ssh uses the FIRST value it
-                # finds for each option, so the managed block goes at the TOP of
-                # ~/.ssh/config, ahead of any hand-written "Host github.com".
-                # It is replaced on every run; the rest of the file is kept.
-                - touch "$SSH_DIR/config"
-                - sed -i '/^# BEGIN clouddev-github$/,/^# END clouddev-github$/d' "$SSH_DIR/config"
-                - CONFIG_TMP=$(mktemp)
-                - |
-                  printf '# BEGIN clouddev-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-github\n' "$NEW_KEY" > "$CONFIG_TMP"
-                - cat "$SSH_DIR/config" >> "$CONFIG_TMP"
-                - cat "$CONFIG_TMP" > "$SSH_DIR/config"
-                - rm -f "$CONFIG_TMP"
-                - chmod 600 "$SSH_DIR/config"
-                # Keep only the newest KEEP keys (names sort by timestamp).
-                - REMOVED=""
-                - |
-                  for OLD in $(ls -1 "$KEY_DIR"/id_ed25519_* 2>/dev/null | grep -v '\.pub$' | sort -r | tail -n +$((KEEP + 1))); do
-                    REMOVED="$REMOVED$(ssh-keygen -lf "$OLD.pub")"$'\n'
-                    rm -f "$OLD" "$OLD.pub"
-                  done
-                - chown -R "$USER_NAME:$USER_NAME" "$SSH_DIR"
-                - echo "=== New GitHub SSH key ==="
-                - 'echo "Title: $TITLE"'
-                - ssh-keygen -lf "$NEW_KEY.pub"
-                - 'echo "Public key (add in GitHub > Settings > SSH keys, or as a deploy key):"'
-                - cat "$NEW_KEY.pub"
-                - echo "=== Removed from this instance (delete the matching keys in GitHub) ==="
-                - 'if [ -n "$REMOVED" ]; then printf "%s" "$REMOVED"; else echo "(none)"; fi'
-                - 'echo "After adding the key, verify with: sudo -u ec2-user ssh -T git@github.com"'
+                  set -euo pipefail
+                  ACTION="{{Action}}"
+                  if [ "$ACTION" = "Install" ]; then
+                    GH_VERSION="{{GhCliVersion}}"
+                    [ -n "$GH_VERSION" ] || { echo "GhCliVersion is required for Action=Install" >&2; exit 1; }
+                    case "$(uname -m)" in
+                      x86_64)  GH_ARCH="amd64" ;;
+                      aarch64) GH_ARCH="arm64" ;;
+                      *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                    esac
+                    dnf install -y tar gzip
+                    TMP_DIR=$(mktemp -d)
+                    curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$TMP_DIR"
+                    install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
+                    rm -rf "$TMP_DIR"
+                    /usr/local/bin/gh --version
+                  elif [ "$ACTION" = "RotateSshKey" ]; then
+                    KEEP="{{KeepKeys}}"
+                    USER_NAME=ec2-user
+                    SSH_DIR="/home/$USER_NAME/.ssh"
+                    KEY_DIR="$SSH_DIR/github"
+                    mkdir -p "$KEY_DIR"
+                    chmod 700 "$SSH_DIR" "$KEY_DIR"
+                    TOKEN=$(curl -sS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds:60" http://169.254.169.254/latest/api/token)
+                    INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                    STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                    TITLE="$INSTANCE_ID-$STAMP"
+                    NEW_KEY="$KEY_DIR/id_ed25519_$STAMP"
+                    ssh-keygen -q -t ed25519 -N "" -C "$TITLE" -f "$NEW_KEY"
+                    touch "$SSH_DIR/config"
+                    sed -i '/^# BEGIN clouddev-github$/,/^# END clouddev-github$/d' "$SSH_DIR/config"
+                    CONFIG_TMP=$(mktemp)
+                    printf '# BEGIN clouddev-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-github\n' "$NEW_KEY" > "$CONFIG_TMP"
+                    cat "$SSH_DIR/config" >> "$CONFIG_TMP"
+                    cat "$CONFIG_TMP" > "$SSH_DIR/config"
+                    rm -f "$CONFIG_TMP"
+                    chmod 600 "$SSH_DIR/config"
+                    REMOVED=""
+                    for OLD in $(ls -1 "$KEY_DIR"/id_ed25519_* 2>/dev/null | grep -v '\.pub$' | sort -r | tail -n +$((KEEP + 1))); do
+                      REMOVED="$REMOVED$(ssh-keygen -lf "$OLD.pub")"$'\n'
+                      rm -f "$OLD" "$OLD.pub"
+                    done
+                    chown -R "$USER_NAME:$USER_NAME" "$SSH_DIR"
+                    echo "=== New GitHub SSH key ==="
+                    echo "Title: $TITLE"
+                    ssh-keygen -lf "$NEW_KEY.pub"
+                    echo "Public key (add in GitHub > Settings > SSH keys, or as a deploy key):"
+                    cat "$NEW_KEY.pub"
+                    echo "=== Removed from this instance (delete the matching keys in GitHub) ==="
+                    if [ -n "$REMOVED" ]; then printf "%s" "$REMOVED"; else echo "(none)"; fi
+                    echo "After adding the key, verify with: sudo -u ec2-user ssh -T git@github.com"
+                  else
+                    echo "Unknown Action: $ACTION" >&2
+                    exit 1
+                  fi
 
   # Automation runbooks that let developers start, stop and restart a dev
   # server from Systems Manager > Automation > Execute. No AssumeRole is set,
