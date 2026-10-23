@@ -19,6 +19,19 @@ Metadata:
           - EnvironmentStackName
           - OllamaClientSecurityGroupId
       - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - SubnetId
+          - AllowedCidr
+      - Label:
+          default: Server
+        Parameters:
+          - KeyPairName
+          - InstanceType
+          - VolumeSize
+          - LatestAmiId
+      - Label:
           default: Idle auto-stop safeguard
         Parameters:
           - EnableIdleShutdown
@@ -39,6 +52,20 @@ Metadata:
         default: CloudDev environment stack name
       OllamaClientSecurityGroupId:
         default: Ollama client security group (optional)
+      VpcId:
+        default: VPC
+      SubnetId:
+        default: Subnet
+      AllowedCidr:
+        default: Allowed SSH CIDR (optional; empty = Session Manager only)
+      KeyPairName:
+        default: Key pair
+      InstanceType:
+        default: Instance type
+      VolumeSize:
+        default: Root volume size (GiB)
+      LatestAmiId:
+        default: AMI (SSM parameter)
       EnableIdleShutdown:
         default: Enable idle auto-stop
       IdleCpuThresholdPercent:
@@ -72,6 +99,31 @@ Parameters:
       outputs (via Fn::ImportValue), so you only supply the stack name here.
     Default: CloudDevEnv
 
+
+  OllamaClientSecurityGroupId:
+    Type: String
+    Description: >-
+      Optional. The OllamaClientSecurityGroupId output of a CloudDev Ollama
+      server stack. When set, it is attached to this server so it can reach
+      Ollama on TCP 11434. Leave empty to skip.
+    Default: ""
+    AllowedPattern: ^(sg-[0-9a-f]{8,17})?$
+    ConstraintDescription: Must be empty or a security group ID, e.g. sg-0123456789abcdef0.
+
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in which to create the security group and dev server.
+
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Public subnet (within the chosen VPC) to launch the instance into.
+      Must have a route to an internet gateway for SSH access and package
+      downloads.
+
+
   AllowedCidr:
     Type: String
     Description: >-
@@ -83,6 +135,12 @@ Parameters:
     Default: ""
     AllowedPattern: ^((\d{1,3}\.){3}\d{1,3}/\d{1,2})?$
     ConstraintDescription: Must be empty or a valid CIDR range, e.g. 203.0.113.4/32.
+
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair to enable SSH access.
+
 
   InstanceType:
     Type: String
@@ -104,30 +162,6 @@ Parameters:
       - c7g.xlarge
       - c7g.2xlarge
 
-  OllamaClientSecurityGroupId:
-    Type: String
-    Description: >-
-      Optional. The OllamaClientSecurityGroupId output of a CloudDev Ollama
-      server stack. When set, it is attached to this server so it can reach
-      Ollama on TCP 11434. Leave empty to skip.
-    Default: ""
-    AllowedPattern: ^(sg-[0-9a-f]{8,17})?$
-    ConstraintDescription: Must be empty or a security group ID, e.g. sg-0123456789abcdef0.
-
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: Name of an existing EC2 key pair to enable SSH access.
-
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC in which to create the security group and dev server.
-
-  SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: >-
-      Public subnet (within the chosen VPC) to launch the instance into.
-      Must have a route to an internet gateway for SSH access and package
-      downloads.
 
   VolumeSize:
     Type: Number
@@ -136,6 +170,7 @@ Parameters:
     MinValue: 8
     MaxValue: 1000
 
+
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Description: >-
@@ -143,6 +178,7 @@ Parameters:
       Leave as the default unless you have a reason to change it. Must be an
       arm64 image to match the Graviton instance types above.
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
 
   EnableIdleShutdown:
     Type: String
@@ -156,6 +192,7 @@ Parameters:
       - "true"
       - "false"
 
+
   IdleCpuThresholdPercent:
     Type: Number
     Description: >-
@@ -164,6 +201,7 @@ Parameters:
     Default: 5
     MinValue: 1
     MaxValue: 100
+
 
   IdleNetworkThresholdMB:
     Type: Number
@@ -177,6 +215,7 @@ Parameters:
     MinValue: 0.1
     MaxValue: 10000
 
+
   IdleStopPeriods:
     Type: Number
     Description: >-
@@ -188,6 +227,7 @@ Parameters:
     Default: 12
     MinValue: 1
     MaxValue: 288
+
 
   # Versioned tools (see K6MajorVersion below): the value IS the tag value,
   # selecting the environment stack's matching per-version association.
@@ -202,6 +242,7 @@ Parameters:
       - v7.4
       - v7.6
 
+
   EnablePlaywright:
     Type: String
     Description: >-
@@ -213,6 +254,7 @@ Parameters:
       - "true"
       - "false"
 
+
   DotNetVersion:
     Type: String
     Description: >-
@@ -223,6 +265,7 @@ Parameters:
       - none
       - v8
       - v10
+
 
   # Versioned tools: the value IS the CloudDev<Tool>Config tag value, which
   # selects the environment stack's matching per-major-version association
@@ -238,6 +281,7 @@ Parameters:
       - v0
       - v1
 
+
   AwsCliMajorVersion:
     Type: String
     Description: >-
@@ -248,6 +292,7 @@ Parameters:
     AllowedValues:
       - none
       - v2
+
 
   GhCliMajorVersion:
     Type: String
