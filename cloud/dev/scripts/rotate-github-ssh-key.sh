@@ -47,9 +47,12 @@ fi
 aws_() { aws "${PROFILE_ARGS[@]}" --region "$REGION" "$@"; }
 
 if [ -z "$DOC" ]; then
+  # list-documents is paginated and --query runs per page, so pages with no
+  # match print "None"; keep only the first real name.
   DOC=$(aws_ ssm list-documents --filters Key=Owner,Values=Self \
-    --query "DocumentIdentifiers[?contains(Name,'AmazonLinuxGhCliV2Document')].Name | [0]" --output text)
-  if [ -z "$DOC" ] || [ "$DOC" = "None" ]; then
+    --query "DocumentIdentifiers[?contains(Name,'AmazonLinuxGhCliV2Document')].Name" --output text \
+    | tr '\t' '\n' | grep -v -E '^(None)?$' | head -n 1 || true)
+  if [ -z "$DOC" ]; then
     echo "Could not find the GitHub SSM document; pass -d <document-name>." >&2
     exit 1
   fi
