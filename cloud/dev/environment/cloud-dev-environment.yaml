@@ -806,34 +806,68 @@ Resources:
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/aws --version
 
-  # GitHub CLI 2.x from GitHub's release tarball (amd64/arm64 picked from
-  # uname) into /usr/local/bin/gh, pinned by GhCliVersion. git itself comes
-  # from dnf with the Node config document.
+  # GitHub document: installs the GitHub CLI 2.x AND rotates the GitHub SSH
+  # key, selected by the Action parameter (steps are skipped by precondition).
+  #  - Install (default): GitHub CLI from GitHub's release tarball
+  #    (amd64/arm64 picked from uname) into /usr/local/bin/gh, pinned by
+  #    GhCliVersion. This is what the association runs at launch. git itself
+  #    comes from dnf with the Node config document.
+  #  - RotateSshKey: on-demand, run it from Run Command or the CLI; the
+  #    association never runs it. Generates a new ed25519 key for ec2-user
+  #    (the private key never leaves the instance), points the github.com
+  #    entry in ~/.ssh/config at it, keeps only the newest KeepKeys keys on
+  #    disk and prints the new public key plus the fingerprints of the keys it
+  #    removed. Adding the new key to GitHub and deleting the old ones there is
+  #    manual: the server holds no GitHub credentials.
   AmazonLinuxGhCliV2Document:
     Type: AWS::SSM::Document
     Properties:
       DocumentType: Command
       DocumentFormat: YAML
-      # Authored WITHOUT Fn::Sub: {{GhCliVersion}} is an SSM document parameter
+      # Authored WITHOUT Fn::Sub: {{...}} tokens are SSM document parameters
       # and must reach the deployed document literally.
       Content:
         schemaVersion: "2.2"
         description: >-
-          Install the GitHub CLI 2.x into /usr/local/bin/gh from GitHub's
-          release tarball. Works on x86_64 and arm64 Amazon Linux.
+          GitHub on Amazon Linux dev servers. Action=Install installs the
+          GitHub CLI 2.x into /usr/local/bin/gh; Action=RotateSshKey generates
+          a new GitHub SSH key for ec2-user and prints the public key to add
+          in GitHub.
         parameters:
+          Action:
+            type: String
+            description: Install the GitHub CLI, or rotate the GitHub SSH key.
+            default: Install
+            allowedValues:
+              - Install
+              - RotateSshKey
           GhCliVersion:
             type: String
             description: >-
-              Exact GitHub CLI 2.x version to install (e.g. 2.103.0).
-            allowedPattern: ^2\.\d+\.\d+$
+              Exact GitHub CLI 2.x version to install (e.g. 2.103.0). Required
+              for Action=Install, ignored for RotateSshKey.
+            default: ""
+            allowedPattern: ^(2\.\d+\.\d+)?$
+          KeepKeys:
+            type: String
+            description: >-
+              RotateSshKey only: how many keys to keep on the instance,
+              including the new one (2 = the new key plus the previous one,
+              for rollback).
+            default: "2"
+            allowedPattern: ^[1-9]$
         mainSteps:
           - action: aws:runShellScript
             name: installGhCli
+            precondition:
+              StringEquals:
+                - "{{Action}}"
+                - Install
             inputs:
               runCommand:
-                - set -euxo pipefail
+                - set -euo pipefail
                 - GH_VERSION="{{GhCliVersion}}"
+                - '[ -n "$GH_VERSION" ] || { echo "GhCliVersion is required for Action=Install" >&2; exit 1; }'
                 - |
                   case "$(uname -m)" in
                     x86_64)  GH_ARCH="amd64" ;;
@@ -846,6 +880,50 @@ Resources:
                 - install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/gh --version
+          - action: aws:runShellScript
+            name: rotateGitHubSshKey
+            precondition:
+              StringEquals:
+                - "{{Action}}"
+                - RotateSshKey
+            inputs:
+              runCommand:
+                - set -euo pipefail
+                - KEEP="{{KeepKeys}}"
+                - USER_NAME=ec2-user
+                - SSH_DIR="/home/$USER_NAME/.ssh"
+                - KEY_DIR="$SSH_DIR/github"
+                - mkdir -p "$KEY_DIR"
+                - chmod 700 "$SSH_DIR" "$KEY_DIR"
+                - TOKEN=$(curl -sS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds:60" http://169.254.169.254/latest/api/token)
+                - INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                - STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                - TITLE="$INSTANCE_ID-$STAMP"
+                - NEW_KEY="$KEY_DIR/id_ed25519_$STAMP"
+                - ssh-keygen -q -t ed25519 -N "" -C "$TITLE" -f "$NEW_KEY"
+                # Make the new key the active one. The managed block is
+                # replaced on every run; the rest of ~/.ssh/config is untouched.
+                - touch "$SSH_DIR/config"
+                - sed -i '/^# BEGIN clouddev-github$/,/^# END clouddev-github$/d' "$SSH_DIR/config"
+                - |
+                  printf '# BEGIN clouddev-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-github\n' "$NEW_KEY" >> "$SSH_DIR/config"
+                - chmod 600 "$SSH_DIR/config"
+                # Keep only the newest KEEP keys (names sort by timestamp).
+                - REMOVED=""
+                - |
+                  for OLD in $(ls -1 "$KEY_DIR"/id_ed25519_* 2>/dev/null | grep -v '\.pub$' | sort -r | tail -n +$((KEEP + 1))); do
+                    REMOVED="$REMOVED$(ssh-keygen -lf "$OLD.pub")"$'\n'
+                    rm -f "$OLD" "$OLD.pub"
+                  done
+                - chown -R "$USER_NAME:$USER_NAME" "$SSH_DIR"
+                - echo "=== New GitHub SSH key ==="
+                - 'echo "Title: $TITLE"'
+                - ssh-keygen -lf "$NEW_KEY.pub"
+                - 'echo "Public key (add in GitHub > Settings > SSH keys, or as a deploy key):"'
+                - cat "$NEW_KEY.pub"
+                - echo "=== Removed from this instance (delete the matching keys in GitHub) ==="
+                - 'if [ -n "$REMOVED" ]; then printf "%s" "$REMOVED"; else echo "(none)"; fi'
+                - 'echo "After adding the key, verify with: sudo -u ec2-user ssh -T git@github.com"'
 
   # Automation runbooks that let developers start, stop and restart a dev
   # server from Systems Manager > Automation > Execute. No AssumeRole is set,
@@ -1082,6 +1160,8 @@ Resources:
       AssociationName: !Sub "${AWS::StackName}-ghcli-v2"
       Name: !Ref AmazonLinuxGhCliV2Document
       Parameters:
+        Action:
+          - Install
         GhCliVersion:
           - !Ref GhCliV2Version
       Targets:
@@ -1459,7 +1539,8 @@ Outputs:
   AmazonLinuxGhCliV2DocumentName:
     Description: >-
       Name of the shared SSM Command Document that installs the GitHub CLI 2.x
-      (GhCliVersion parameter) on Amazon Linux dev servers.
+      (Action=Install, GhCliVersion parameter) and rotates the GitHub SSH key
+      (Action=RotateSshKey, run on demand) on Amazon Linux dev servers.
     Value: !Ref AmazonLinuxGhCliV2Document
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxGhCliV2DocumentName"

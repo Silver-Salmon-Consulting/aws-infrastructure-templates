@@ -166,6 +166,73 @@ Server stacks do not take an exact version. Changing the fleet version means
 updating the environment stack and re-applying the association on existing
 servers (new servers pick it up automatically).
 
+### GitHub SSH key rotation
+
+The GitHub document (`AmazonLinuxGhCliV2Document`) does two jobs, selected by its
+`Action` parameter. `Install` (the default, run by the association at launch)
+installs the GitHub CLI. `RotateSshKey` is **on demand only**; nothing runs it
+automatically. It:
+
+1. generates a new ed25519 key for `ec2-user` in `~/.ssh/github/` (the private
+   key never leaves the instance);
+2. points the `github.com` entry in `~/.ssh/config` at the new key (a managed
+   block between `# BEGIN/END clouddev-github` markers; the rest of the file is
+   untouched);
+3. keeps only the newest `KeepKeys` keys on the instance (default `2`: the new
+   key plus the previous one for rollback) and deletes the rest;
+4. prints the new public key, its fingerprint, a suggested GitHub title
+   (`<instance-id>-<timestamp>`) and the fingerprints of the keys it removed.
+
+It cannot touch GitHub: the server holds no GitHub credentials. Adding the new
+public key and deleting the old ones in GitHub is a manual step. GitHub SSH keys
+never expire on their own, so rotation is what keeps them short-lived. Prefer
+**deploy keys** (one repo, read-only by default) or a dedicated **machine user**
+over a personal account's key.
+
+**Run it from anywhere** you have AWS credentials and `ssm:SendCommand` — your
+laptop, CloudShell, or the console. The instance only needs to be running and
+SSM-managed.
+
+```bash
+# Look up the document name and the instance (once)
+DOC=$(aws cloudformation describe-stacks --stack-name <environment-stack> \
+  --query "Stacks[0].Outputs[?OutputKey=='AmazonLinuxGhCliV2DocumentName'].OutputValue" --output text)
+INSTANCE=<i-0123456789abcdef0>
+
+# Rotate the key and print the result
+CMD=$(aws ssm send-command --document-name "$DOC" --instance-ids "$INSTANCE" \
+  --parameters Action=RotateSshKey,KeepKeys=2 \
+  --query "Command.CommandId" --output text)
+aws ssm wait command-executed --command-id "$CMD" --instance-id "$INSTANCE"
+aws ssm get-command-invocation --command-id "$CMD" --instance-id "$INSTANCE" \
+  --query "StandardOutputContent" --output text
+```
+
+In the console: **Systems Manager > Run Command > Run command**, pick the
+document, set `Action` to `RotateSshKey`, choose the instance, run, then open the
+instance's output. To rotate every dev server in the environment at once, replace
+`--instance-ids "$INSTANCE"` with
+`--targets Key=tag:CloudDevEnvironment,Values=<value of the tag on your servers>`.
+
+Then register the printed public key and clean up the old one. With the GitHub CLI
+signed in wherever you are:
+
+```bash
+# Add the new key (paste the printed public key and title)
+echo '<printed public key>' | gh ssh-key add - --title '<printed title>'
+# or, as a read-only deploy key on one repo
+echo '<printed public key>' | gh repo deploy-key add - --repo <owner>/<repo> --title '<printed title>'
+
+# Remove the key the run reported as deleted (match by the printed fingerprint)
+gh ssh-key list
+gh ssh-key delete <id>
+```
+
+Verify on the server: `sudo -u ec2-user ssh -T git@github.com` (a "Hi
+<name>!" reply means the key works). Run the document with `Action=Install` and
+a `GhCliVersion` only if you want to reinstall the CLI by hand; the association
+already does this with the environment stack's pinned `GhCliV2Version`.
+
 ## Deployment
 
 > **Stack naming matters.** The environment role only allows signaling
