@@ -431,7 +431,11 @@ instance when it is idle, as a cost guard against a forgotten-running box:
 The alarm is a metric-math alarm over `CPUUtilization`, `NetworkIn` and
 `NetworkOut`, using a 300-second period to match EC2 basic monitoring's
 5-minute resolution. Requiring both signals keeps background CPU noise from
-holding a quiet box up, and keeps a busy download from being stopped. The instance stops (EBS persists; restart it later).
+holding a quiet box up, and keeps a busy download from being stopped.
+CloudWatch does not allow the built-in EC2 stop action on metric-math alarms, so
+the alarm has no action: an EventBridge rule sends its `ALARM` state change to a
+small Lambda (`IdleStopFunction`, allowed to stop only that one instance), which
+stops it. The instance stops (EBS persists; restart it later).
 A truly idle box you are connected to will still stop after the window — raise
 `IdleStopPeriods` or set `EnableIdleShutdown=false` if that is a problem.
 

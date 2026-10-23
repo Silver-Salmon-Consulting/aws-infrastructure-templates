@@ -485,9 +485,9 @@ Resources:
   # NetworkOut below IdleNetworkThresholdMB) for IdleStopPeriods consecutive
   # periods. CPU alone was too easily held above the threshold by background
   # agents, so the box never stopped. Metric math emits 1 for an idle period;
-  # the alarm fires when that stays >= 1. Every underlying metric carries the
-  # InstanceId dimension, which the built-in EC2 'stop' alarm action
-  # (arn:aws:automate:...:ec2:stop) requires; no Lambda or IAM role needed.
+  # the alarm fires when that stays >= 1. CloudWatch does not allow the
+  # built-in EC2 'stop' alarm action on metric-math alarms, so the stop is done
+  # by an EventBridge rule and Lambda (IdleStop* below).
   # Period is 300s to match EC2 basic monitoring. TreatMissingData is
   # notBreaching so a gap in metrics never triggers a stop. Created only when
   # EnableIdleShutdown=true.
@@ -542,8 +542,91 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
-      AlarmActions:
-        - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:stop"
+
+  # CloudWatch does not allow EC2 actions (arn:aws:automate:...:ec2:stop) on
+  # metric-math alarms, so the alarm above has no action. Instead EventBridge
+  # sends its ALARM state change to this small Lambda, which stops (not
+  # terminates) only this stack's instance. Created only when
+  # EnableIdleShutdown=true.
+  IdleStopRole:
+    Type: AWS::IAM::Role
+    Condition: IdleShutdownEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: StopThisInstance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:StopInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${DevServerInstance}"
+
+  IdleStopFunction:
+    Type: AWS::Lambda::Function
+    Condition: IdleShutdownEnabled
+    Properties:
+      Description: Stops this dev server when its idle alarm fires.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt IdleStopRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref DevServerInstance
+      Code:
+        ZipFile: |
+          import logging
+          import os
+
+          import boto3
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+
+          def handler(event, context):
+              instance_id = os.environ["INSTANCE_ID"]
+              alarm = event.get("detail", {}).get("alarmName")
+              log.info("idle alarm %s fired; stopping %s", alarm, instance_id)
+              boto3.client("ec2").stop_instances(InstanceIds=[instance_id])
+
+  IdleStopRule:
+    Type: AWS::Events::Rule
+    Condition: IdleShutdownEnabled
+    Properties:
+      Description: Stop the dev server when its idle alarm goes to ALARM.
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - !Ref IdleShutdownAlarm
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: IdleStop
+          Arn: !GetAtt IdleStopFunction.Arn
+
+  IdleStopInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IdleShutdownEnabled
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IdleStopFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdleStopRule.Arn
 
 # ---------------------------------------------------------------------------
 # Outputs
