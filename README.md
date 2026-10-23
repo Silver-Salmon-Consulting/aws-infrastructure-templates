@@ -186,7 +186,9 @@ automatically. It:
 3. keeps only the newest `KeepKeys` keys on the instance (default `2`: the new
    key plus the previous one for rollback) and deletes the rest;
 4. prints the new public key, its fingerprint, a suggested GitHub title
-   (`<instance-id>-<timestamp>`) and the fingerprints of the keys it removed.
+   (`<server name>-<timestamp>`, where the server name is the instance's
+   `DnsName` tag if set, else its CloudFormation stack name, else the instance
+   ID) and the fingerprints of the keys it removed.
 
 It cannot touch GitHub: the server holds no GitHub credentials. Adding the new
 public key and deleting the old ones in GitHub is a manual step. GitHub SSH keys
