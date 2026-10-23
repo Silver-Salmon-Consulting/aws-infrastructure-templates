@@ -438,6 +438,26 @@ Resources:
                   ;;
               esac
 
+              # On failure, copy the tail of the bootstrap log to CloudWatch Logs
+              # (stream <instance-id>/bootstrap-failure) BEFORE signalling, because
+              # CloudFormation deletes the instance on rollback and the CloudWatch
+              # agent may not be running yet. Best-effort; never fails the script.
+              ship_failure_log() {
+                local group="${BootstrapLogGroupName}" stream="$INSTANCE_ID/bootstrap-failure"
+                aws logs create-log-stream --log-group-name "$group" --log-stream-name "$stream" --region "$REGION" || true
+                tail -n 300 /var/log/cloud-init-output.log 2>/dev/null | python3 -c '
+              import json, sys, time
+              lines = [l.rstrip("\n")[:8000] or " " for l in sys.stdin]
+              lines = lines or ["(no bootstrap log lines available)"]
+              now = int(time.time() * 1000)
+              print(json.dumps([{"timestamp": now + i, "message": m} for i, m in enumerate(lines)]))
+              ' > /tmp/bootstrap-failure-events.json || true
+                aws logs put-log-events --log-group-name "$group" --log-stream-name "$stream" \
+                  --log-events file:///tmp/bootstrap-failure-events.json --region "$REGION" > /dev/null \
+                  && log "copied the last bootstrap log lines to $group / $stream" \
+                  || log "could not copy the bootstrap log to CloudWatch Logs"
+              }
+
               signal_cfn() {
                 local status="$1" out rc attempt
                 for attempt in 1 2 3; do
@@ -464,7 +484,10 @@ Resources:
                 log "ERROR: could not deliver the $status signal; CloudFormation will fail this resource when the CreationPolicy times out."
                 return 0
               }
-              trap 'rc=$?; log "bootstrap script exiting with status $rc"; if [ "$rc" -eq 0 ]; then signal_cfn SUCCESS; else signal_cfn FAILURE; fi' EXIT
+              # Record which command failed (set -e stops the script there).
+              set -E
+              trap 'log "ERROR: command failed (exit $?) at line $LINENO: $BASH_COMMAND"' ERR
+              trap 'rc=$?; log "bootstrap script exiting with status $rc"; if [ "$rc" -eq 0 ]; then signal_cfn SUCCESS; else ship_failure_log; signal_cfn FAILURE; fi' EXIT
 
               # NOTE: no package installs here. UserData only needs to start the
               # CloudWatch agent and signal CloudFormation; it compiles nothing.

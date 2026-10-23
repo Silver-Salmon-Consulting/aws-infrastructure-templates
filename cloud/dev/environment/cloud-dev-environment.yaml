@@ -745,10 +745,18 @@ Resources:
               runCommand:
                 - set -euxo pipefail
                 # Playwright needs Node (installed by the Node config
-                # document). SSM shells load no profile, so source nvm
-                # directly; fail fast if Node is not there yet.
+                # document). That association runs at the same time as this
+                # one at first boot, so wait for Node (up to 15 minutes)
+                # instead of failing. SSM shells load no profile, so source
+                # nvm directly.
                 - export HOME=/root
-                - '{ [ -s /opt/nvm/nvm.sh ] && . /opt/nvm/nvm.sh && command -v node; } || { echo "Node.js not found (apply the Node config document first)" >&2; exit 1; }'
+                - |
+                  for i in $(seq 1 90); do
+                    if [ -s /opt/nvm/nvm.sh ] && ( . /opt/nvm/nvm.sh && command -v node ) >/dev/null 2>&1; then break; fi
+                    echo "Waiting for Node.js to be installed ($i/90)..."
+                    sleep 10
+                  done
+                - '. /opt/nvm/nvm.sh && command -v node || { echo "Node.js not found after waiting (check the Node config association)" >&2; exit 1; }'
                 # Shared libraries Chromium links against. Installed strictly
                 # so a missing package fails the association visibly.
                 - >-

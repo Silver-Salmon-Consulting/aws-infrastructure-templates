@@ -295,8 +295,12 @@ Bootstrap signalling is logged as `[cfn-signal <time>]` lines to
 the journal (`journalctl -t cfn-signal`) and the EC2 console output (Actions >
 Monitor and troubleshoot > Get system log). They record the stack, instance, AWS
 CLI version and caller identity, whether the stack name matches the prefix, and
-each signal attempt with its full error. To debug a failed create without
-losing the instance, deploy with `--disable-rollback`.
+each signal attempt with its full error. If the bootstrap script itself fails, it
+logs the failing command and line (`ERROR: command failed ... at line N`) and copies
+the last 300 lines of the bootstrap log to the bootstrap log group as stream
+`<instance-id>/bootstrap-failure` **before** sending the `FAILURE` signal, so the
+reason survives CloudFormation deleting the instance on rollback. To debug a failed
+create with the instance still running, deploy with `--disable-rollback`.
 
 The instance reaches `CREATE_COMPLETE` once it boots and signals — **before**
 Node/PowerShell finish installing. Those install asynchronously via SSM State
