@@ -15,13 +15,11 @@ boot scripts — so it is maintained centrally and re-appliable on demand.
 
 ```
 cloud/dev/
-  environment/
-    cloud-dev-environment.yaml          # shared: IAM role, log group, SSM documents, VPC
-    cloud-dev-permission-set.yaml       # Identity Center permission set for developers
-  server/
-    cloud-dev-server-amazon-linux.yaml      # x86_64 (AMD) dev server
-    cloud-dev-server-amazon-linux-arm.yaml  # arm64 (Graviton) dev server
-    cloud-dev-ollama-server.yaml            # private GPU Ollama LLM server
+  cloud-dev-environment.yaml          # shared: IAM role, log group, SSM documents, VPC
+  cloud-dev-permission-set.yaml       # Identity Center permission set for developers
+  cloud-dev-server-amazon-linux.yaml      # x86_64 (AMD) dev server
+  cloud-dev-server-amazon-linux-arm.yaml  # arm64 (Graviton) dev server
+  cloud-dev-ollama-server.yaml            # private GPU Ollama LLM server
 ```
 
 ### Architecture
