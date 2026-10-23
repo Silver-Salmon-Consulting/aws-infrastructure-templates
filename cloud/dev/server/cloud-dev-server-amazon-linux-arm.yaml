@@ -93,10 +93,12 @@ Parameters:
       - t4g.large
       - t4g.xlarge
       - t4g.2xlarge
-      - m6g.large
-      - m6g.xlarge
-      - c6g.large
-      - c6g.xlarge
+      - m7g.large
+      - m7g.xlarge
+      - m7g.2xlarge
+      - c7g.large
+      - c7g.xlarge
+      - c7g.2xlarge
 
   OllamaClientSecurityGroupId:
     Type: String
