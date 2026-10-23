@@ -26,10 +26,9 @@ Metadata:
       - Label:
           default: Software (installed via shared SSM documents)
         Parameters:
-          - EnablePowerShell
+          - PowerShellVersion
           - EnablePlaywright
-          - EnableDotNet8
-          - EnableDotNet10
+          - DotNetVersion
           - K6MajorVersion
           - AwsCliMajorVersion
     ParameterLabels:
@@ -45,14 +44,12 @@ Metadata:
         default: Idle network threshold (MB per 5 min)
       IdleStopPeriods:
         default: Idle 5-min periods before stop
-      EnablePowerShell:
-        default: Install PowerShell
+      PowerShellVersion:
+        default: PowerShell version
       EnablePlaywright:
         default: Install Playwright dependencies
-      EnableDotNet8:
-        default: Install .NET 8 SDK
-      EnableDotNet10:
-        default: Install .NET 10 SDK
+      DotNetVersion:
+        default: .NET SDK major version
       K6MajorVersion:
         default: k6 major version
       AwsCliMajorVersion:
@@ -180,47 +177,40 @@ Parameters:
     MinValue: 1
     MaxValue: 288
 
-  EnablePowerShell:
+  # Versioned tools (see K6MajorVersion below): the value IS the tag value,
+  # selecting the environment stack's matching per-version association.
+  PowerShellVersion:
     Type: String
     Description: >-
-      Install PowerShell (pwsh) on the instance by applying the shared
-      PowerShell SSM document from the environment stack.
-    Default: "true"
+      PowerShell release line to install (the exact release is set by the
+      environment stack), or "none" to skip PowerShell.
+    Default: none
     AllowedValues:
-      - "true"
-      - "false"
+      - none
+      - v7.4
+      - v7.6
 
   EnablePlaywright:
     Type: String
     Description: >-
-      Install the system libraries and fonts Playwright's Chromium needs by
+      Install the system libraries and fonts Playwright's Chromium needs, plus
+      the Chromium build for the environment stack's PlaywrightVersion, by
       applying the shared Playwright SSM document from the environment stack.
-      Browser binaries are not installed; run `npx playwright install
-      chromium` in your project.
     Default: "false"
     AllowedValues:
       - "true"
       - "false"
 
-  EnableDotNet8:
+  DotNetVersion:
     Type: String
     Description: >-
-      Install the .NET 8 SDK (side by side under /opt/dotnet) by applying the
-      shared .NET SDK SSM document from the environment stack.
-    Default: "false"
+      .NET SDK major version to install under /opt/dotnet (the exact SDK is
+      set by the environment stack), or "none" to skip .NET.
+    Default: none
     AllowedValues:
-      - "true"
-      - "false"
-
-  EnableDotNet10:
-    Type: String
-    Description: >-
-      Install the .NET 10 SDK (side by side under /opt/dotnet) by applying the
-      shared .NET SDK SSM document from the environment stack.
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
+      - none
+      - v8
+      - v10
 
   # Versioned tools: the value IS the CloudDev<Tool>Config tag value, which
   # selects the environment stack's matching per-major-version association
@@ -247,22 +237,13 @@ Parameters:
       - none
       - v2
 
-  # PowerShellVersion is intentionally NOT a server-stack parameter. The
-  # fleet-wide PowerShell version is owned by the CloudDev environment stack
-  # (its DefaultPowerShellVersion param, baked into the PowerShell SSM
-  # document's default), so the association below passes no version and the
-  # document default governs.
-
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
 Conditions:
   AttachOllamaClientSg: !Not [!Equals [!Ref OllamaClientSecurityGroupId, ""]]
   IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
-  PowerShellEnabled: !Equals [!Ref EnablePowerShell, "true"]
   PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
-  DotNet8Enabled: !Equals [!Ref EnableDotNet8, "true"]
-  DotNet10Enabled: !Equals [!Ref EnableDotNet10, "true"]
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -318,21 +299,18 @@ Resources:
         # gets Node. Remove this tag to decouple from the association.
         - Key: CloudDevNodeConfig
           Value: enabled
-        # Opts into the environment stack's PowerShellConfigAssociation when
-        # EnablePowerShell=true. "disabled" simply does not match the
-        # association target, so pwsh is skipped without needing a
-        # conditional resource.
+        # Selects the environment stack's per-version PowerShell association
+        # by tag value (v7.4 | v7.6); "none" matches nothing.
         - Key: CloudDevPowerShellConfig
-          Value: !If [PowerShellEnabled, "enabled", "disabled"]
+          Value: !Ref PowerShellVersion
         # Opts into the environment stack's PlaywrightConfigAssociation when
         # EnablePlaywright=true (same enabled/disabled pattern as above).
         - Key: CloudDevPlaywrightConfig
           Value: !If [PlaywrightEnabled, "enabled", "disabled"]
-        # Opt into the environment stack's per-channel .NET SDK associations.
-        - Key: CloudDevDotNet8Config
-          Value: !If [DotNet8Enabled, "enabled", "disabled"]
-        - Key: CloudDevDotNet10Config
-          Value: !If [DotNet10Enabled, "enabled", "disabled"]
+        # Selects the environment stack's per-major .NET SDK association by
+        # tag value (v8 | v10); "none" matches nothing.
+        - Key: CloudDevDotNetConfig
+          Value: !Ref DotNetVersion
         # jq, zip and unzip. Every dev server gets them, like Node.
         - Key: CloudDevBaseToolsConfig
           Value: enabled

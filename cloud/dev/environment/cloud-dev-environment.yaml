@@ -26,10 +26,14 @@ Metadata:
           - VpcCidr
           - AllowedCidr
       - Label:
-          default: Server software defaults (fleet-wide, via SSM documents)
+          default: Server software versions (fleet-wide, via SSM documents)
         Parameters:
           - DefaultNodeVersion
-          - DefaultPowerShellVersion
+          - PowerShell74Version
+          - PowerShell76Version
+          - DotNet8Version
+          - DotNet10Version
+          - PlaywrightVersion
     ParameterLabels:
       StackNamePrefix:
         default: Stack name prefix
@@ -37,8 +41,16 @@ Metadata:
         default: Bootstrap log retention (days)
       DefaultNodeVersion:
         default: Default Node.js version
-      DefaultPowerShellVersion:
-        default: Default PowerShell version
+      PowerShell74Version:
+        default: PowerShell 7.4 version
+      PowerShell76Version:
+        default: PowerShell 7.6 version
+      DotNet8Version:
+        default: .NET 8 SDK version
+      DotNet10Version:
+        default: .NET 10 SDK version
+      PlaywrightVersion:
+        default: Playwright version
       VpcMode:
         default: VPC topology
       AzCount:
@@ -91,14 +103,49 @@ Parameters:
       - "24"
       - "26"
 
-  DefaultPowerShellVersion:
+  # Version parameters for the versioned tool documents. Intentionally NO
+  # defaults: the exact release to install is always an explicit choice. A
+  # value is only used by servers that select that document's major, but
+  # CloudFormation still needs a value for every parameter.
+  PowerShell74Version:
     Type: String
     Description: >-
-      Fleet-wide default PowerShell version. Baked into the PowerShell config
-      SSM document as its PowerShellVersion parameter default, so every dev
-      server that applies the document installs this version. 7.6.6 is the
-      current LTS (as of October 2026).
-    Default: "7.6.6"
+      Exact PowerShell 7.4.x release installed by the PowerShell 7.4 document
+      (e.g. 7.4.13).
+    AllowedPattern: ^7\.4\.\d+$
+    ConstraintDescription: Must be a 7.4.x version, e.g. 7.4.13.
+
+  PowerShell76Version:
+    Type: String
+    Description: >-
+      Exact PowerShell 7.6.x release installed by the PowerShell 7.6 document
+      (e.g. 7.6.6).
+    AllowedPattern: ^7\.6\.\d+$
+    ConstraintDescription: Must be a 7.6.x version, e.g. 7.6.6.
+
+  DotNet8Version:
+    Type: String
+    Description: >-
+      .NET 8 SDK to install: a channel ("8.0", newest 8.0 SDK) or an exact SDK
+      version (e.g. 8.0.415).
+    AllowedPattern: ^8\.0(\.\d+)?$
+    ConstraintDescription: Must be 8.0 or an 8.0.x SDK version.
+
+  DotNet10Version:
+    Type: String
+    Description: >-
+      .NET 10 SDK to install: a channel ("10.0", newest 10.0 SDK) or an exact
+      SDK version (e.g. 10.0.100).
+    AllowedPattern: ^10\.0(\.\d+)?$
+    ConstraintDescription: Must be 10.0 or a 10.0.x SDK version.
+
+  PlaywrightVersion:
+    Type: String
+    Description: >-
+      Playwright version the Playwright document installs the matching
+      Chromium for (e.g. 1.55.0), into the shared /opt/playwright-browsers.
+    AllowedPattern: ^\d+\.\d+\.\d+$
+    ConstraintDescription: Must be an exact version, e.g. 1.55.0.
 
   VpcMode:
     Type: String
@@ -280,12 +327,14 @@ Resources:
                 - chmod +x /etc/profile.d/nvm.sh
                 - chown -R ec2-user:ec2-user /opt/nvm
 
-  # Managed, versioned SSM Command Document that installs PowerShell (pwsh) on
-  # Amazon Linux via Microsoft's per-architecture tarball, so it works on both
-  # x86_64 and arm64 instances (the script picks the right tarball from uname).
-  # Server stacks apply it via an SSM Association (see the server templates).
-  # Amazon Linux specific; Ubuntu would get its own document.
-  AmazonLinuxPowerShellDocument:
+  # Versioned SSM Command Documents that install PowerShell (pwsh) on Amazon
+  # Linux via Microsoft's per-architecture tarball, so they work on both
+  # x86_64 and arm64 instances (the script picks the right tarball from
+  # uname). ONE DOCUMENT PER RELEASE LINE (7.4, 7.6); the exact release comes
+  # from the environment stack's PowerShell<line>Version parameter, passed by
+  # the association (no default). A server picks a line with the
+  # CloudDevPowerShellConfig tag VALUE. Amazon Linux specific.
+  AmazonLinuxPowerShellV74Document:
     Type: AWS::SSM::Document
     Properties:
       DocumentType: Command
@@ -296,17 +345,14 @@ Resources:
       Content:
         schemaVersion: "2.2"
         description: >-
-          Install PowerShell (pwsh) from Microsoft's per-architecture tarball
+          Install PowerShell 7.4.x from Microsoft's per-architecture tarball
           into /opt/microsoft/powershell/7 and symlink /usr/bin/pwsh. Works on
           both x86_64 and arm64 Amazon Linux.
         parameters:
           PowerShellVersion:
             type: String
-            description: PowerShell version to install (e.g. 7.6.6).
-            # Fleet-wide default from the DefaultPowerShellVersion stack
-            # parameter. !Sub only touches ${...}; the {{PowerShellVersion}}
-            # placeholder in the runCommand below is left literal.
-            default: !Sub "${DefaultPowerShellVersion}"
+            description: PowerShell 7.4.x version to install (e.g. 7.4.13).
+            allowedPattern: ^7\.4\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installPowerShell
@@ -322,10 +368,60 @@ Resources:
                   esac
                 - dnf install -y tar gzip libicu
                 - INSTALL_DIR="/opt/microsoft/powershell/7"
+                # Replace any previously installed release so switching
+                # versions leaves exactly one pwsh.
+                - rm -rf "$INSTALL_DIR"
                 - mkdir -p "$INSTALL_DIR"
                 - TARBALL="/tmp/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
                 - URL="https://github.com/PowerShell/PowerShell/releases/download/v$PS_VERSION/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
-                - curl -sSL "$URL" -o "$TARBALL"
+                - curl -sSfL "$URL" -o "$TARBALL"
+                - tar -xzf "$TARBALL" -C "$INSTALL_DIR"
+                - chmod +x "$INSTALL_DIR/pwsh"
+                - ln -sf "$INSTALL_DIR/pwsh" /usr/bin/pwsh
+                - rm -f "$TARBALL"
+                - /usr/bin/pwsh --version
+
+  AmazonLinuxPowerShellV76Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{PowerShellVersion}} is an SSM document
+      # parameter and must reach the deployed document literally. There are
+      # intentionally NO ${...} CloudFormation variables in this script.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install PowerShell 7.6.x from Microsoft's per-architecture tarball
+          into /opt/microsoft/powershell/7 and symlink /usr/bin/pwsh. Works on
+          both x86_64 and arm64 Amazon Linux.
+        parameters:
+          PowerShellVersion:
+            type: String
+            description: PowerShell 7.6.x version to install (e.g. 7.6.6).
+            allowedPattern: ^7\.6\.\d+$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installPowerShell
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - PS_VERSION="{{PowerShellVersion}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  PS_ARCH="x64" ;;
+                    aarch64) PS_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y tar gzip libicu
+                - INSTALL_DIR="/opt/microsoft/powershell/7"
+                # Replace any previously installed release so switching
+                # versions leaves exactly one pwsh.
+                - rm -rf "$INSTALL_DIR"
+                - mkdir -p "$INSTALL_DIR"
+                - TARBALL="/tmp/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
+                - URL="https://github.com/PowerShell/PowerShell/releases/download/v$PS_VERSION/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
+                - curl -sSfL "$URL" -o "$TARBALL"
                 - tar -xzf "$TARBALL" -C "$INSTALL_DIR"
                 - chmod +x "$INSTALL_DIR/pwsh"
                 - ln -sf "$INSTALL_DIR/pwsh" /usr/bin/pwsh
@@ -336,22 +432,30 @@ Resources:
   # libraries and fonts Playwright's Chromium needs to run headless on Amazon
   # Linux. `npx playwright install-deps` only supports Debian/Ubuntu (apt), so
   # the equivalent dnf packages are listed here. Browser binaries themselves
-  # are NOT installed: they are versioned per project, so run
-  # `npx playwright install chromium` in the project. Chromium is the
-  # supported engine on Amazon Linux; Playwright's WebKit/Firefox builds
-  # target Ubuntu. Works on x86_64 and arm64. Amazon Linux specific.
+  # are installed for the PlaywrightVersion passed by the association, into
+  # the shared /opt/playwright-browsers (PLAYWRIGHT_BROWSERS_PATH is exported
+  # in /etc/profile.d/playwright.sh), so a project pinned to that version
+  # needs no download. Chromium is the supported engine on Amazon Linux;
+  # Playwright's WebKit/Firefox builds target Ubuntu. Works on x86_64 and
+  # arm64. Amazon Linux specific.
   AmazonLinuxPlaywrightDocument:
     Type: AWS::SSM::Document
     Properties:
       DocumentType: Command
       DocumentFormat: YAML
-      # No SSM parameters and NO ${...} CloudFormation variables.
+      # Authored WITHOUT Fn::Sub: {{PlaywrightVersion}} is an SSM document
+      # parameter and must reach the deployed document literally.
       Content:
         schemaVersion: "2.2"
         description: >-
           Install the system libraries and fonts Playwright's Chromium needs
           to run headless on Amazon Linux (x86_64 and arm64), plus Xvfb for
-          headed runs. Does not download browser binaries.
+          headed runs, then the Chromium build for the given Playwright version.
+        parameters:
+          PlaywrightVersion:
+            type: String
+            description: Playwright version to install Chromium for (e.g. 1.55.0).
+            allowedPattern: ^\d+\.\d+\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installPlaywrightDependencies
@@ -380,31 +484,43 @@ Resources:
                   liberation-fonts google-noto-sans-fonts
                   google-noto-emoji-color-fonts
                 - fc-cache -f || true
+                # Chromium for the requested Playwright version, shared by
+                # every user via PLAYWRIGHT_BROWSERS_PATH.
+                - export PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+                - mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+                - npx --yes "playwright@{{PlaywrightVersion}}" install chromium
+                - chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
+                - printf 'export PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers\n' > /etc/profile.d/playwright.sh
+                - chmod +x /etc/profile.d/playwright.sh
 
-  # Managed, versioned SSM Command Document that installs a .NET SDK (build,
-  # run, test) side by side under /opt/dotnet using Microsoft's
-  # dotnet-install.sh, which picks the right x64/arm64 build automatically.
-  # One document serves every channel: the 8.0 and 10.0 associations below
-  # pass DotNetChannel. Amazon Linux specific (dnf for the native deps).
-  AmazonLinuxDotNetSdkDocument:
+  # Versioned SSM Command Documents that install a .NET SDK (build, run, test)
+  # under /opt/dotnet using Microsoft's dotnet-install.sh, which picks the
+  # right x64/arm64 build automatically. ONE DOCUMENT PER MAJOR VERSION (8,
+  # 10); the channel or exact SDK version comes from the environment stack's
+  # DotNet<major>Version parameter, passed by the association (no default). A
+  # server picks a major with the CloudDevDotNetConfig tag VALUE.
+  # Amazon Linux specific (dnf for the native deps).
+  AmazonLinuxDotNet8SdkDocument:
     Type: AWS::SSM::Document
     Properties:
       DocumentType: Command
       DocumentFormat: YAML
-      # Authored WITHOUT Fn::Sub: {{DotNetChannel}} is an SSM document
+      # Authored WITHOUT Fn::Sub: {{DotNetVersion}} is an SSM document
       # parameter and must reach the deployed document literally. There are
       # intentionally NO ${...} CloudFormation variables in this script.
       Content:
         schemaVersion: "2.2"
         description: >-
-          Install a .NET SDK channel side by side into /opt/dotnet, symlink
-          /usr/bin/dotnet and expose DOTNET_ROOT through
-          /etc/profile.d/dotnet.sh. Works on x86_64 and arm64 Amazon Linux.
+          Install the .NET 8 SDK into /opt/dotnet, symlink /usr/bin/dotnet
+          and expose DOTNET_ROOT through /etc/profile.d/dotnet.sh. Works on
+          x86_64 and arm64 Amazon Linux.
         parameters:
-          DotNetChannel:
+          DotNetVersion:
             type: String
-            description: .NET SDK channel to install (e.g. 8.0, 10.0).
-            default: "10.0"
+            description: >-
+              .NET 8 SDK: the channel 8.0 (newest SDK) or an exact SDK
+              version (e.g. 8.0.415).
+            allowedPattern: ^8\.0(\.\d+)?$
         mainSteps:
           - action: aws:runShellScript
             name: installDotNetSdk
@@ -413,14 +529,60 @@ Resources:
                 - set -euxo pipefail
                 # dotnet-install.sh resolves paths from HOME; SSM leaves it unset.
                 - export HOME=/root
-                - dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++ util-linux
+                - dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++
                 - INSTALL_DIR=/opt/dotnet
                 - mkdir -p "$INSTALL_DIR"
-                - curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-                # Channels install into the same directory and share the
-                # dotnet host files; the 8.0 and 10.0 associations can run at
-                # the same time, so serialize them with a lock.
-                - flock /var/lock/clouddev-dotnet-install.lock bash /tmp/dotnet-install.sh --channel "{{DotNetChannel}}" --install-dir "$INSTALL_DIR" --no-path
+                - curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+                # "8.0" is a channel; "8.0.415" is an exact SDK version.
+                - |
+                  case "{{DotNetVersion}}" in
+                    *.*.*) bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
+                    *)     bash /tmp/dotnet-install.sh --channel "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
+                  esac
+                - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
+                - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
+                - chmod +x /etc/profile.d/dotnet.sh
+                - /usr/bin/dotnet --list-sdks
+
+  AmazonLinuxDotNet10SdkDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{DotNetVersion}} is an SSM document
+      # parameter and must reach the deployed document literally. There are
+      # intentionally NO ${...} CloudFormation variables in this script.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install the .NET 10 SDK into /opt/dotnet, symlink /usr/bin/dotnet
+          and expose DOTNET_ROOT through /etc/profile.d/dotnet.sh. Works on
+          x86_64 and arm64 Amazon Linux.
+        parameters:
+          DotNetVersion:
+            type: String
+            description: >-
+              .NET 10 SDK: the channel 10.0 (newest SDK) or an exact SDK
+              version (e.g. 10.0.100).
+            allowedPattern: ^10\.0(\.\d+)?$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installDotNetSdk
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                # dotnet-install.sh resolves paths from HOME; SSM leaves it unset.
+                - export HOME=/root
+                - dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++
+                - INSTALL_DIR=/opt/dotnet
+                - mkdir -p "$INSTALL_DIR"
+                - curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+                # "8.0" is a channel; "8.0.415" is an exact SDK version.
+                - |
+                  case "{{DotNetVersion}}" in
+                    *.*.*) bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
+                    *)     bash /tmp/dotnet-install.sh --channel "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
+                  esac
                 - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
                 - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
                 - chmod +x /etc/profile.d/dotnet.sh
@@ -708,64 +870,80 @@ Resources:
           Values:
             - enabled
 
-  # Tag-targeted association that applies the PowerShell document to every
-  # dev server tagged CloudDevPowerShellConfig=enabled. Same rationale as
-  # above: intra-stack !Ref, no Parameters (document default governs),
-  # launch-only. A server opts out by tagging the value anything other than
-  # "enabled" (the server stacks use "disabled" when EnablePowerShell=false).
-  PowerShellConfigAssociation:
+  # Per-major-version associations for PowerShell and .NET (same pattern as
+  # k6 below): each tool has ONE tag key and the tag VALUE selects the
+  # document, so a server matches at most one association per tool. Each
+  # passes its exact version from the matching environment stack parameter
+  # (the documents have no defaults). Launch-only; a server opts out with a
+  # value that matches nothing ("none").
+  PowerShellV74ConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
-      AssociationName: !Sub "${AWS::StackName}-powershell"
-      Name: !Ref AmazonLinuxPowerShellDocument
+      AssociationName: !Sub "${AWS::StackName}-powershell-v74"
+      Name: !Ref AmazonLinuxPowerShellV74Document
+      Parameters:
+        PowerShellVersion:
+          - !Ref PowerShell74Version
       Targets:
         - Key: "tag:CloudDevPowerShellConfig"
           Values:
-            - enabled
+            - v7.4
 
-  # Tag-targeted association that applies the Playwright dependencies
-  # document to every dev server tagged CloudDevPlaywrightConfig=enabled.
-  # Same pattern as the PowerShell association (the server stacks use
-  # "disabled" when EnablePlaywright=false).
+  PowerShellV76ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-powershell-v76"
+      Name: !Ref AmazonLinuxPowerShellV76Document
+      Parameters:
+        PowerShellVersion:
+          - !Ref PowerShell76Version
+      Targets:
+        - Key: "tag:CloudDevPowerShellConfig"
+          Values:
+            - v7.6
+
+  # Tag-targeted association that applies the Playwright document to every
+  # dev server tagged CloudDevPlaywrightConfig=enabled, passing the
+  # environment stack's PlaywrightVersion (the server stacks use "disabled"
+  # when EnablePlaywright=false).
   PlaywrightConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: !Sub "${AWS::StackName}-playwright"
       Name: !Ref AmazonLinuxPlaywrightDocument
+      Parameters:
+        PlaywrightVersion:
+          - !Ref PlaywrightVersion
       Targets:
         - Key: "tag:CloudDevPlaywrightConfig"
           Values:
             - enabled
 
-  # Tag-targeted associations that apply the .NET SDK document once per
-  # channel. Unlike the others, these pass DotNetChannel explicitly, since
-  # the same document serves both. Servers opt in per channel with
-  # CloudDevDotNet8Config / CloudDevDotNet10Config = enabled.
   DotNet8ConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: !Sub "${AWS::StackName}-dotnet8"
-      Name: !Ref AmazonLinuxDotNetSdkDocument
+      Name: !Ref AmazonLinuxDotNet8SdkDocument
       Parameters:
-        DotNetChannel:
-          - "8.0"
+        DotNetVersion:
+          - !Ref DotNet8Version
       Targets:
-        - Key: "tag:CloudDevDotNet8Config"
+        - Key: "tag:CloudDevDotNetConfig"
           Values:
-            - enabled
+            - v8
 
   DotNet10ConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: !Sub "${AWS::StackName}-dotnet10"
-      Name: !Ref AmazonLinuxDotNetSdkDocument
+      Name: !Ref AmazonLinuxDotNet10SdkDocument
       Parameters:
-        DotNetChannel:
-          - "10.0"
+        DotNetVersion:
+          - !Ref DotNet10Version
       Targets:
-        - Key: "tag:CloudDevDotNet10Config"
+        - Key: "tag:CloudDevDotNetConfig"
           Values:
-            - enabled
+            - v10
 
   # Tag-targeted association that applies the base tools document. Every dev
   # server tags itself CloudDevBaseToolsConfig=enabled, like Node.
@@ -1107,29 +1285,46 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxServerConfigDocumentName"
 
-  AmazonLinuxPowerShellDocumentName:
+  AmazonLinuxPowerShellV74DocumentName:
     Description: >-
-      Name of the shared SSM Command Document that installs PowerShell (pwsh)
-      on Amazon Linux dev servers (per-architecture tarball; x86_64 and arm64).
-    Value: !Ref AmazonLinuxPowerShellDocument
+      Name of the shared SSM Command Document that installs PowerShell 7.4.x
+      (PowerShellVersion parameter) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxPowerShellV74Document
     Export:
-      Name: !Sub "${AWS::StackName}-AmazonLinuxPowerShellDocumentName"
+      Name: !Sub "${AWS::StackName}-AmazonLinuxPowerShellV74DocumentName"
+
+  AmazonLinuxPowerShellV76DocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs PowerShell 7.6.x
+      (PowerShellVersion parameter) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxPowerShellV76Document
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxPowerShellV76DocumentName"
 
   AmazonLinuxPlaywrightDocumentName:
     Description: >-
       Name of the shared SSM Command Document that installs Playwright's
-      Chromium system dependencies on Amazon Linux dev servers.
+      Chromium system dependencies and the Chromium build for the
+      PlaywrightVersion parameter on Amazon Linux dev servers.
     Value: !Ref AmazonLinuxPlaywrightDocument
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxPlaywrightDocumentName"
 
-  AmazonLinuxDotNetSdkDocumentName:
+  AmazonLinuxDotNet8SdkDocumentName:
     Description: >-
-      Name of the shared SSM Command Document that installs a .NET SDK
-      channel (DotNetChannel parameter) on Amazon Linux dev servers.
-    Value: !Ref AmazonLinuxDotNetSdkDocument
+      Name of the shared SSM Command Document that installs the .NET 8 SDK
+      (DotNetVersion parameter) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxDotNet8SdkDocument
     Export:
-      Name: !Sub "${AWS::StackName}-AmazonLinuxDotNetSdkDocumentName"
+      Name: !Sub "${AWS::StackName}-AmazonLinuxDotNet8SdkDocumentName"
+
+  AmazonLinuxDotNet10SdkDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs the .NET 10 SDK
+      (DotNetVersion parameter) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxDotNet10SdkDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxDotNet10SdkDocumentName"
 
   AmazonLinuxBaseToolsDocumentName:
     Description: >-

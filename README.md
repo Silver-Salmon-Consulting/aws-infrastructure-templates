@@ -33,13 +33,12 @@ cloud/dev/
     plus scoped inline policies that let the instances signal CloudFormation and
     write bootstrap logs;
   - a CloudWatch Logs group for instance bootstrap output;
-  - eight SSM Command Documents — one installs Node.js/npm via nvm, one
-    installs PowerShell (per-architecture tarball, works on x86_64 and arm64),
-    one installs the system libraries/fonts Playwright's Chromium needs, one
-    installs a .NET SDK channel (`DotNetChannel` parameter), one installs
-    jq/zip/unzip, and three are per-major-version tool documents (k6 0.x,
-    k6 1.x, AWS CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
-  - nine **tag-targeted** SSM State Manager associations that apply those
+  - nine SSM Command Documents — one installs Node.js/npm via nvm, one
+    installs the system libraries/fonts and Chromium build Playwright needs
+    (takes a `PlaywrightVersion`), one installs jq/zip/unzip, and the rest are
+    per-version tool documents (PowerShell 7.4 and 7.6, .NET 8 and 10, k6 0.x
+    and 1.x, AWS CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
+  - **tag-targeted** SSM State Manager associations that apply those
     documents to any instance carrying the matching tag;
   - an optional VPC (`public` or `public-private`, 1–3 AZs).
 - **Server stacks** (`cloud-dev-server-*.yaml`) — each launches one EC2 instance.
@@ -61,44 +60,54 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
 1. The environment stack owns the install logic as SSM Command Documents.
 2. The environment stack owns tag-targeted associations:
    - `NodeConfigAssociation` targets `tag:CloudDevNodeConfig = enabled`
-   - `PowerShellConfigAssociation` targets `tag:CloudDevPowerShellConfig = enabled`
+   - `PowerShellV74ConfigAssociation` / `PowerShellV76ConfigAssociation` target
+     `tag:CloudDevPowerShellConfig = v7.4` / `v7.6` (pass `PowerShell74Version` /
+     `PowerShell76Version`)
    - `PlaywrightConfigAssociation` targets `tag:CloudDevPlaywrightConfig = enabled`
-   - `DotNet8ConfigAssociation` targets `tag:CloudDevDotNet8Config = enabled`
-     (passes `DotNetChannel=8.0`)
-   - `DotNet10ConfigAssociation` targets `tag:CloudDevDotNet10Config = enabled`
-     (passes `DotNetChannel=10.0`)
+     (passes `PlaywrightVersion`)
+   - `DotNet8ConfigAssociation` / `DotNet10ConfigAssociation` target
+     `tag:CloudDevDotNetConfig = v8` / `v10` (pass `DotNet8Version` /
+     `DotNet10Version`)
    - `BaseToolsConfigAssociation` targets `tag:CloudDevBaseToolsConfig = enabled`
    - `K6V0ConfigAssociation` / `K6V1ConfigAssociation` target
      `tag:CloudDevK6Config = v0` / `v1`
    - `AwsCliV2ConfigAssociation` targets `tag:CloudDevAwsCliConfig = v2`
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
-   - `CloudDevPowerShellConfig = enabled` when `EnablePowerShell=true`, else
-     `disabled` (any value other than `enabled` simply does not match)
+   - `CloudDevPowerShellConfig = <PowerShellVersion>` (`none` / `v7.4` / `v7.6`,
+     default `none`)
    - `CloudDevPlaywrightConfig = enabled` when `EnablePlaywright=true`
      (default `false`), else `disabled`
-   - `CloudDevDotNet8Config` / `CloudDevDotNet10Config = enabled` when
-     `EnableDotNet8` / `EnableDotNet10=true` (both default `false`)
+   - `CloudDevDotNetConfig = <DotNetVersion>` (`none` / `v8` / `v10`, default
+     `none`)
    - `CloudDevBaseToolsConfig = enabled` (always — jq, zip and unzip)
    - `CloudDevK6Config = <K6MajorVersion>` (`none` / `v0` / `v1`, default `none`)
    - `CloudDevAwsCliConfig = <AwsCliMajorVersion>` (`none` / `v2`, default `none`)
 
-The .NET SDKs install side by side into `/opt/dotnet` (via Microsoft's
-`dotnet-install.sh`, x64 or arm64 automatically), with `/usr/bin/dotnet`
-symlinked and `DOTNET_ROOT` set in `/etc/profile.d/dotnet.sh`. Pin a project to
-a specific SDK with `global.json`; `dotnet --list-sdks` shows what is installed.
+The .NET SDK installs into `/opt/dotnet` (via Microsoft's `dotnet-install.sh`,
+x64 or arm64 automatically), with `/usr/bin/dotnet` symlinked and `DOTNET_ROOT`
+set in `/etc/profile.d/dotnet.sh`. `DotNet8Version` / `DotNet10Version` accept
+a channel (`8.0`, newest SDK) or an exact SDK (`8.0.415`). Pin a project to a
+specific SDK with `global.json`; `dotnet --list-sdks` shows what is installed.
 
-The Playwright document installs only OS dependencies (the dnf equivalent of
-`npx playwright install-deps`, which supports apt only) plus Xvfb. Browser
-binaries are versioned per project, so run `npx playwright install chromium` in
-the project. Chromium is the supported engine on Amazon Linux; Playwright's
-WebKit and Firefox builds target Ubuntu.
+The Playwright document installs the OS dependencies (the dnf equivalent of
+`npx playwright install-deps`, which supports apt only) plus Xvfb, then runs
+`npx playwright@<PlaywrightVersion> install chromium` into the shared
+`/opt/playwright-browsers` (`PLAYWRIGHT_BROWSERS_PATH` is set in
+`/etc/profile.d/playwright.sh`). A project pinned to that Playwright version
+needs no browser download. Chromium is the supported engine on Amazon Linux;
+Playwright's WebKit and Firefox builds target Ubuntu.
 
 ### Versioned tool documents
 
-Tools whose version matters to a project (k6, the AWS CLI) follow one pattern:
-**one SSM document per tool per major version**, for example
-`AmazonLinuxK6V0Document` and `AmazonLinuxK6V1Document`.
+Tools whose version matters to a project (PowerShell, .NET, k6, the AWS CLI)
+follow one pattern: **one SSM document per tool per major version** (PowerShell:
+per release line), for example `AmazonLinuxK6V0Document` and
+`AmazonLinuxK6V1Document`. PowerShell (7.4, 7.6) and .NET (8, 10) differ from
+k6/AWS CLI in one way: their documents have **no `latest` default**; the exact
+version comes from a required environment-stack parameter
+(`PowerShell74Version`, `PowerShell76Version`, `DotNet8Version`,
+`DotNet10Version`) that the association passes in.
 
 - The document fixes the major version. Its version parameter (`K6Version`,
   `AwsCliVersion`) defaults to `latest`, the newest release **within that
@@ -140,10 +149,14 @@ Node and PowerShell versions are set **once, on the environment stack**, and
 flow into the SSM documents' parameter defaults:
 
 - `DefaultNodeVersion` (default `24`) — Node.js major version (22 / 24 / 26)
-- `DefaultPowerShellVersion` (default `7.6.6`) — PowerShell version
+- `PowerShell74Version`, `PowerShell76Version`, `DotNet8Version`,
+  `DotNet10Version`, `PlaywrightVersion` — **no defaults**; you must set each
+  at deploy time. Servers only choose *which* PowerShell/.NET line to install
+  (`PowerShellVersion`, `DotNetVersion` dropdowns); the exact release is
+  fleet-wide.
 
-Server stacks do not take a Node/PowerShell version. Changing the fleet version
-means updating the environment stack and re-applying the association on existing
+Server stacks do not take an exact version. Changing the fleet version means
+updating the environment stack and re-applying the association on existing
 servers (new servers pick it up automatically).
 
 ## Deployment
@@ -303,7 +316,11 @@ A truly idle box you are connected to will still stop after the window — raise
 | `StackNamePrefix` | `CloudDev` | Scopes which stacks the shared role may signal |
 | `LogRetentionDays` | `7` | Bootstrap log retention |
 | `DefaultNodeVersion` | `24` | Fleet-wide Node.js version |
-| `DefaultPowerShellVersion` | `7.6.6` | Fleet-wide PowerShell version |
+| `PowerShell74Version` | *(required)* | Exact PowerShell 7.4.x release |
+| `PowerShell76Version` | *(required)* | Exact PowerShell 7.6.x release |
+| `DotNet8Version` | *(required)* | .NET 8 channel (`8.0`) or exact SDK |
+| `DotNet10Version` | *(required)* | .NET 10 channel (`10.0`) or exact SDK |
+| `PlaywrightVersion` | *(required)* | Playwright version to install Chromium for |
 | `VpcMode` | `none` | `none` / `public` / `public-private` |
 | `AzCount` | `1` | Availability Zones (1–3) when a VPC is created |
 | `VpcCidr` | `10.0.0.0/16` | VPC CIDR when a VPC is created |
