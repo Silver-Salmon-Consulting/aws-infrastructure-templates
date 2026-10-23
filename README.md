@@ -368,19 +368,51 @@ Notes:
 
 ## Connecting
 
-Connect via **Session Manager** — no SSH key or open port required, and it uses
-the attached SSM role:
+Connect with **Session Manager**: no open port, no key to share, access is
+controlled by your AWS permissions and every session is logged in CloudTrail.
+Leave the server stack's `AllowedCidr` empty (the default) and the security group
+opens **no inbound port at all**; Session Manager only needs the instance's
+outbound connection to AWS. If you do set `AllowedCidr`, port 22 is opened to
+that CIDR only.
+
+**Shell.** Console: EC2 > select the instance > Connect > Session Manager. CLI
+(needs AWS CLI v2 and the
+[Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)):
 
 ```bash
 aws ssm start-session --target <instance-id> --region <region>
 ```
 
-The server stack's `SessionManagerCommand` output gives you this line directly.
+The server stack's `SessionManagerCommand` output prints this line. Sessions start
+as `ssm-user`; run `sudo su - ec2-user` for the normal environment (Node, `gh`,
+`~/.aws` and the rest are set up for `ec2-user`).
 
-> Why not SSH / a public-IP output? The public IP is **ephemeral** — it changes
-> on every stop/start, which the idle auto-stop safeguard (below) triggers. SSH
-> still works from `AllowedCidr` if you fetch the current IP from the console,
-> but it is intentionally not a stack output. The default login user for Amazon
+**SSH and VS Code Remote-SSH over Session Manager.** The SSH connection is
+tunnelled through SSM, so it works with port 22 closed. It needs the key pair the
+stack was created with. Add to `~/.ssh/config` on your machine:
+
+```
+Host i-* mi-*
+    ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region>
+    User ec2-user
+    IdentityFile ~/.ssh/<your-key-pair>.pem
+    StrictHostKeyChecking accept-new
+```
+
+Then `ssh i-0123456789abcdef0`, or in VS Code run **Remote-SSH: Connect to
+Host...** and enter the instance ID. For SSO profiles add `--profile <name>` to
+the `ProxyCommand` or set `AWS_PROFILE`. VS Code installs its server on the
+instance, which needs outbound internet.
+
+**Permissions.** The CloudDev permission set allows `ssm:StartSession` on
+instances tagged `CloudDevEnvironment=<stack>`, using only the shell document
+(`SSM-SessionManagerRunShell`) and the SSH tunnel document (`AWS-StartSSHSession`),
+and lets you end or resume your own sessions. Anyone who can start a session gets a
+shell on the server, so assign the permission set accordingly.
+
+> Why no public-IP output? The public IP is **ephemeral**: it changes on every
+> stop/start, which the idle auto-stop safeguard (below) triggers. Session Manager
+> targets the instance ID, which never changes. The default login user for Amazon
 > Linux is `ec2-user`.
 
 ## Idle auto-stop safeguard
