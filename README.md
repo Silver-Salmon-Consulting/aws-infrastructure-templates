@@ -179,8 +179,10 @@ automatically. It:
 1. generates a new ed25519 key for `ec2-user` in `~/.ssh/github/` (the private
    key never leaves the instance);
 2. points the `github.com` entry in `~/.ssh/config` at the new key (a managed
-   block between `# BEGIN/END clouddev-github` markers; the rest of the file is
-   untouched);
+   block between `# BEGIN/END clouddev-github` markers, placed at the **top** of
+   the file because ssh uses the first value it finds; the rest of the file is
+   kept). A hand-written `Host github.com` block further down still lists its own
+   key as a fallback, so remove it once you no longer want the old key used;
 3. keeps only the newest `KeepKeys` keys on the instance (default `2`: the new
    key plus the previous one for rollback) and deletes the rest;
 4. prints the new public key, its fingerprint, a suggested GitHub title

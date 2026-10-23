@@ -1128,12 +1128,18 @@ Resources:
                 - TITLE="$INSTANCE_ID-$STAMP"
                 - NEW_KEY="$KEY_DIR/id_ed25519_$STAMP"
                 - ssh-keygen -q -t ed25519 -N "" -C "$TITLE" -f "$NEW_KEY"
-                # Make the new key the active one. The managed block is
-                # replaced on every run; the rest of ~/.ssh/config is untouched.
+                # Make the new key the active one. ssh uses the FIRST value it
+                # finds for each option, so the managed block goes at the TOP of
+                # ~/.ssh/config, ahead of any hand-written "Host github.com".
+                # It is replaced on every run; the rest of the file is kept.
                 - touch "$SSH_DIR/config"
                 - sed -i '/^# BEGIN clouddev-github$/,/^# END clouddev-github$/d' "$SSH_DIR/config"
+                - CONFIG_TMP=$(mktemp)
                 - |
-                  printf '# BEGIN clouddev-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-github\n' "$NEW_KEY" >> "$SSH_DIR/config"
+                  printf '# BEGIN clouddev-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-github\n' "$NEW_KEY" > "$CONFIG_TMP"
+                - cat "$SSH_DIR/config" >> "$CONFIG_TMP"
+                - cat "$CONFIG_TMP" > "$SSH_DIR/config"
+                - rm -f "$CONFIG_TMP"
                 - chmod 600 "$SSH_DIR/config"
                 # Keep only the newest KEEP keys (names sort by timestamp).
                 - REMOVED=""
