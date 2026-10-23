@@ -219,6 +219,21 @@ instance's output. To rotate every dev server in the environment at once, replac
 `--instance-ids "$INSTANCE"` with
 `--targets Key=tag:CloudDevEnvironment,Values=<value of the tag on your servers>`.
 
+**Shortcut script.** [cloud/dev/scripts/rotate-github-ssh-key.sh](cloud/dev/scripts/rotate-github-ssh-key.sh)
+does the lookup, send, wait and output in one command. By default it targets the
+instance it runs on, finds the document by name and keeps 2 keys:
+
+```bash
+install -m 0755 cloud/dev/scripts/rotate-github-ssh-key.sh ~/.local/bin/rotate-github-key
+rotate-github-key -p <profile>            # this server; -p = a profile from ~/.aws/credentials
+rotate-github-key -i i-0123456789abcdef0  # another server (-r region, -k keep, -d document)
+```
+
+A server's own role cannot send commands, so on a server use a profile whose
+permissions include `ssm:SendCommand` (for example the CloudDev permission set's
+credentials) in `~/.aws/credentials`. From your laptop, no `-p` is needed beyond
+your normal AWS login.
+
 Then register the printed public key and clean up the old one. With the GitHub CLI
 signed in wherever you are:
 
