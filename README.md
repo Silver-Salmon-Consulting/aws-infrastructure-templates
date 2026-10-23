@@ -190,6 +190,11 @@ automatically. It:
    `DnsName` tag if set, else its CloudFormation stack name, else the instance
    ID) and the fingerprints of the keys it removed.
 
+The same document's `Install` action also creates a code directory for `ec2-user`
+(`/home/ec2-user/github` by default, set with the `CodeDirectory` document
+parameter), ready to `git clone` into. It is created once, existing contents are
+never touched, and re-running it is safe.
+
 It cannot touch GitHub: the server holds no GitHub credentials. Adding the new
 public key and deleting the old ones in GitHub is a manual step. GitHub SSH keys
 never expire on their own, so rotation is what keeps them short-lived. Prefer

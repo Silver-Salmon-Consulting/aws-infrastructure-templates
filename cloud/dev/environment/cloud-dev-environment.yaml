@@ -1091,7 +1091,7 @@ Resources:
         description: >-
           GitHub on Amazon Linux dev servers. Action=Install installs the
           GitHub CLI 2.x into /usr/local/bin/gh plus the rotate-github-key
-          helper into /usr/local/bin; Action=RotateSshKey generates
+          helper into /usr/local/bin and creates the CodeDirectory for ec2-user; Action=RotateSshKey generates
           a new GitHub SSH key for ec2-user and prints the public key to add
           in GitHub.
         parameters:
@@ -1109,6 +1109,13 @@ Resources:
               for Action=Install, ignored for RotateSshKey.
             default: ""
             allowedPattern: ^(2\.\d+\.\d+)?$
+          CodeDirectory:
+            type: String
+            description: >-
+              Install only: directory created for ec2-user to clone code into.
+              Existing contents are never touched.
+            default: /home/ec2-user/github
+            allowedPattern: ^/home/ec2-user/[A-Za-z0-9._/-]+$
           KeepKeys:
             type: String
             description: >-
@@ -1285,6 +1292,13 @@ Resources:
                   ROTATE_EOF
                   chmod 0755 /usr/local/bin/rotate-github-key
                   /usr/local/bin/rotate-github-key -h > /dev/null
+
+                  # A directory ready for code, owned by ec2-user. Safe to re-run:
+                  # mkdir -p and chown on the directory itself only.
+                  CODE_DIR="{{CodeDirectory}}"
+                  mkdir -p "$CODE_DIR"
+                  chown ec2-user:ec2-user "$CODE_DIR"
+                  chmod 0755 "$CODE_DIR"
 
   # Automation runbooks that let developers start, stop and restart a dev
   # server from Systems Manager > Automation > Execute. No AssumeRole is set,
