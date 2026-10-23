@@ -34,6 +34,9 @@ Metadata:
           - DotNet8Version
           - DotNet10Version
           - PlaywrightVersion
+          - K6V0Version
+          - K6V1Version
+          - AwsCliV2Version
     ParameterLabels:
       StackNamePrefix:
         default: Stack name prefix
@@ -51,6 +54,12 @@ Metadata:
         default: .NET 10 SDK version
       PlaywrightVersion:
         default: Playwright version
+      K6V0Version:
+        default: k6 0.x version
+      K6V1Version:
+        default: k6 1.x version
+      AwsCliV2Version:
+        default: AWS CLI 2.x version
       VpcMode:
         default: VPC topology
       AzCount:
@@ -103,49 +112,84 @@ Parameters:
       - "24"
       - "26"
 
-  # Version parameters for the versioned tool documents. Intentionally NO
-  # defaults: the exact release to install is always an explicit choice. A
-  # value is only used by servers that select that document's major, but
-  # CloudFormation still needs a value for every parameter.
+  # Exact, pinned versions for the versioned tool documents, so every dev
+  # server gets the same release and rebuilds are reproducible. Nothing floats
+  # to "latest": bump a default here (and update the stack) to roll the fleet
+  # forward. A value is only used by servers that select that document, but
+  # CloudFormation needs a value for every parameter.
   PowerShell74Version:
     Type: String
     Description: >-
-      Exact PowerShell 7.4.x release installed by the PowerShell 7.4 document
-      (e.g. 7.4.13).
+      Exact PowerShell 7.4.x release installed by the PowerShell 7.4 document.
+      7.4.21 is the latest 7.4 release (as of October 2026).
+    Default: "7.4.21"
     AllowedPattern: ^7\.4\.\d+$
-    ConstraintDescription: Must be a 7.4.x version, e.g. 7.4.13.
+    ConstraintDescription: Must be a 7.4.x version, e.g. 7.4.21.
 
   PowerShell76Version:
     Type: String
     Description: >-
-      Exact PowerShell 7.6.x release installed by the PowerShell 7.6 document
-      (e.g. 7.6.6).
+      Exact PowerShell 7.6.x release installed by the PowerShell 7.6 document.
+      7.6.8 is the latest 7.6 release, the current LTS line (as of October
+      2026).
+    Default: "7.6.8"
     AllowedPattern: ^7\.6\.\d+$
-    ConstraintDescription: Must be a 7.6.x version, e.g. 7.6.6.
+    ConstraintDescription: Must be a 7.6.x version, e.g. 7.6.8.
 
   DotNet8Version:
     Type: String
     Description: >-
-      .NET 8 SDK to install: a channel ("8.0", newest 8.0 SDK) or an exact SDK
-      version (e.g. 8.0.415).
-    AllowedPattern: ^8\.0(\.\d+)?$
-    ConstraintDescription: Must be 8.0 or an 8.0.x SDK version.
+      Exact .NET 8 SDK version installed by the .NET 8 document. 8.0.426 is
+      the latest 8.0 SDK (as of October 2026).
+    Default: "8.0.426"
+    AllowedPattern: ^8\.0\.\d+$
+    ConstraintDescription: Must be an 8.0.x SDK version, e.g. 8.0.426.
 
   DotNet10Version:
     Type: String
     Description: >-
-      .NET 10 SDK to install: a channel ("10.0", newest 10.0 SDK) or an exact
-      SDK version (e.g. 10.0.100).
-    AllowedPattern: ^10\.0(\.\d+)?$
-    ConstraintDescription: Must be 10.0 or a 10.0.x SDK version.
+      Exact .NET 10 SDK version installed by the .NET 10 document. 10.0.402 is
+      the latest 10.0 SDK (as of October 2026).
+    Default: "10.0.402"
+    AllowedPattern: ^10\.0\.\d+$
+    ConstraintDescription: Must be a 10.0.x SDK version, e.g. 10.0.402.
 
   PlaywrightVersion:
     Type: String
     Description: >-
       Playwright version the Playwright document installs the matching
-      Chromium for (e.g. 1.55.0), into the shared /opt/playwright-browsers.
+      Chromium for, into the shared /opt/playwright-browsers. 1.64.1 is the
+      latest release (as of October 2026).
+    Default: "1.64.1"
     AllowedPattern: ^\d+\.\d+\.\d+$
-    ConstraintDescription: Must be an exact version, e.g. 1.55.0.
+    ConstraintDescription: Must be an exact version, e.g. 1.64.1.
+
+  K6V0Version:
+    Type: String
+    Description: >-
+      Exact k6 0.x version installed by the k6 0.x document. 0.59.0 is the
+      latest 0.x release (as of October 2026).
+    Default: "0.59.0"
+    AllowedPattern: ^0\.\d+\.\d+$
+    ConstraintDescription: Must be a 0.x.y version, e.g. 0.59.0.
+
+  K6V1Version:
+    Type: String
+    Description: >-
+      Exact k6 1.x version installed by the k6 1.x document. 1.8.2 is the
+      latest 1.x release (as of October 2026).
+    Default: "1.8.2"
+    AllowedPattern: ^1\.\d+\.\d+$
+    ConstraintDescription: Must be a 1.x.y version, e.g. 1.8.2.
+
+  AwsCliV2Version:
+    Type: String
+    Description: >-
+      Exact AWS CLI 2.x version installed by the AWS CLI 2.x document. 2.38.5
+      is the latest 2.x release (as of October 2026).
+    Default: "2.38.5"
+    AllowedPattern: ^2\.\d+\.\d+$
+    ConstraintDescription: Must be a 2.x.y version, e.g. 2.38.5.
 
   VpcMode:
     Type: String
@@ -332,7 +376,7 @@ Resources:
   # x86_64 and arm64 instances (the script picks the right tarball from
   # uname). ONE DOCUMENT PER RELEASE LINE (7.4, 7.6); the exact release comes
   # from the environment stack's PowerShell<line>Version parameter, passed by
-  # the association (no default). A server picks a line with the
+  # the association (the documents themselves have no default). A server picks a line with the
   # CloudDevPowerShellConfig tag VALUE. Amazon Linux specific.
   AmazonLinuxPowerShellV74Document:
     Type: AWS::SSM::Document
@@ -496,8 +540,9 @@ Resources:
   # Versioned SSM Command Documents that install a .NET SDK (build, run, test)
   # under /opt/dotnet using Microsoft's dotnet-install.sh, which picks the
   # right x64/arm64 build automatically. ONE DOCUMENT PER MAJOR VERSION (8,
-  # 10); the channel or exact SDK version comes from the environment stack's
-  # DotNet<major>Version parameter, passed by the association (no default). A
+  # 10); the exact SDK version comes from the environment stack's
+  # DotNet<major>Version parameter, passed by the association (the documents
+  # themselves have no default). A
   # server picks a major with the CloudDevDotNetConfig tag VALUE.
   # Amazon Linux specific (dnf for the native deps).
   AmazonLinuxDotNet8SdkDocument:
@@ -518,9 +563,8 @@ Resources:
           DotNetVersion:
             type: String
             description: >-
-              .NET 8 SDK: the channel 8.0 (newest SDK) or an exact SDK
-              version (e.g. 8.0.415).
-            allowedPattern: ^8\.0(\.\d+)?$
+              Exact .NET 8 SDK version to install (e.g. 8.0.426).
+            allowedPattern: ^8\.0\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installDotNetSdk
@@ -533,12 +577,7 @@ Resources:
                 - INSTALL_DIR=/opt/dotnet
                 - mkdir -p "$INSTALL_DIR"
                 - curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-                # "8.0" is a channel; "8.0.415" is an exact SDK version.
-                - |
-                  case "{{DotNetVersion}}" in
-                    *.*.*) bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
-                    *)     bash /tmp/dotnet-install.sh --channel "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
-                  esac
+                - bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path
                 - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
                 - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
                 - chmod +x /etc/profile.d/dotnet.sh
@@ -562,9 +601,8 @@ Resources:
           DotNetVersion:
             type: String
             description: >-
-              .NET 10 SDK: the channel 10.0 (newest SDK) or an exact SDK
-              version (e.g. 10.0.100).
-            allowedPattern: ^10\.0(\.\d+)?$
+              Exact .NET 10 SDK version to install (e.g. 10.0.402).
+            allowedPattern: ^10\.0\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installDotNetSdk
@@ -577,12 +615,7 @@ Resources:
                 - INSTALL_DIR=/opt/dotnet
                 - mkdir -p "$INSTALL_DIR"
                 - curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-                # "8.0" is a channel; "8.0.415" is an exact SDK version.
-                - |
-                  case "{{DotNetVersion}}" in
-                    *.*.*) bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
-                    *)     bash /tmp/dotnet-install.sh --channel "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path ;;
-                  esac
+                - bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path
                 - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
                 - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
                 - chmod +x /etc/profile.d/dotnet.sh
@@ -613,16 +646,15 @@ Resources:
 
   # Versioned tool documents: ONE DOCUMENT PER TOOL PER MAJOR VERSION. The
   # major version is fixed by the document (and its name); the document's
-  # version parameter defaults to "latest", the newest release within that
-  # major, and also accepts an exact version to pin. A server picks a major
+  # version parameter is an exact version within that major, passed by the
+  # association from the environment stack (K6V0Version etc.); nothing floats
+  # to "latest". A server picks a major
   # with the tool's tag VALUE (e.g. CloudDevK6Config = v0 | v1), so it can
   # only match one major's association at a time. Add a major by copying a
   # document + association and changing the major number.
   #
   # k6 0.x: installs the k6 binary from Grafana's GitHub release tarball
-  # (amd64/arm64 picked from uname) into /usr/local/bin/k6. "latest" is
-  # resolved from the repo's release tags with git ls-remote (no GitHub API
-  # rate limit), ignoring pre-release tags.
+  # (amd64/arm64 picked from uname) into /usr/local/bin/k6, pinned by K6Version.
   AmazonLinuxK6V0Document:
     Type: AWS::SSM::Document
     Properties:
@@ -639,17 +671,14 @@ Resources:
           K6Version:
             type: String
             description: >-
-              k6 0.x version to install (e.g. 0.55.0), or "latest" for the
-              newest 0.x release.
-            default: latest
-            allowedPattern: ^(latest|0\.\d+\.\d+)$
+              Exact k6 0.x version to install (e.g. 0.59.0).
+            allowedPattern: ^0\.\d+\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installK6
             inputs:
               runCommand:
                 - set -euxo pipefail
-                - K6_MAJOR=0
                 - K6_VERSION="{{K6Version}}"
                 - |
                   case "$(uname -m)" in
@@ -657,20 +686,14 @@ Resources:
                     aarch64) K6_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y git tar gzip
-                - |
-                  if [ "$K6_VERSION" = "latest" ]; then
-                    K6_VERSION=$(git ls-remote --tags --refs https://github.com/grafana/k6.git "v$K6_MAJOR.*" \
-                      | sed -n "s|.*refs/tags/v\($K6_MAJOR\.[0-9]*\.[0-9]*\)$|\1|p" | sort -V | tail -n 1)
-                    [ -n "$K6_VERSION" ] || { echo "No k6 v$K6_MAJOR release found" >&2; exit 1; }
-                  fi
+                - dnf install -y tar gzip
                 - TMP_DIR=$(mktemp -d)
                 - curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" | tar -xz -C "$TMP_DIR"
                 - install -m 0755 "$TMP_DIR/k6-v$K6_VERSION-linux-$K6_ARCH/k6" /usr/local/bin/k6
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/k6 version
 
-  # k6 1.x: same script as the 0.x document with K6_MAJOR=1.
+  # k6 1.x: same script as the 0.x document, with a 1.x version pattern.
   AmazonLinuxK6V1Document:
     Type: AWS::SSM::Document
     Properties:
@@ -687,17 +710,14 @@ Resources:
           K6Version:
             type: String
             description: >-
-              k6 1.x version to install (e.g. 1.3.0), or "latest" for the
-              newest 1.x release.
-            default: latest
-            allowedPattern: ^(latest|1\.\d+\.\d+)$
+              Exact k6 1.x version to install (e.g. 1.8.2).
+            allowedPattern: ^1\.\d+\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installK6
             inputs:
               runCommand:
                 - set -euxo pipefail
-                - K6_MAJOR=1
                 - K6_VERSION="{{K6Version}}"
                 - |
                   case "$(uname -m)" in
@@ -705,13 +725,7 @@ Resources:
                     aarch64) K6_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y git tar gzip
-                - |
-                  if [ "$K6_VERSION" = "latest" ]; then
-                    K6_VERSION=$(git ls-remote --tags --refs https://github.com/grafana/k6.git "v$K6_MAJOR.*" \
-                      | sed -n "s|.*refs/tags/v\($K6_MAJOR\.[0-9]*\.[0-9]*\)$|\1|p" | sort -V | tail -n 1)
-                    [ -n "$K6_VERSION" ] || { echo "No k6 v$K6_MAJOR release found" >&2; exit 1; }
-                  fi
+                - dnf install -y tar gzip
                 - TMP_DIR=$(mktemp -d)
                 - curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" | tar -xz -C "$TMP_DIR"
                 - install -m 0755 "$TMP_DIR/k6-v$K6_VERSION-linux-$K6_ARCH/k6" /usr/local/bin/k6
@@ -741,10 +755,8 @@ Resources:
           AwsCliVersion:
             type: String
             description: >-
-              AWS CLI 2.x version to install (e.g. 2.31.0), or "latest" for the
-              newest 2.x release.
-            default: latest
-            allowedPattern: ^(latest|2\.\d+\.\d+)$
+              Exact AWS CLI 2.x version to install (e.g. 2.38.5).
+            allowedPattern: ^2\.\d+\.\d+$
         mainSteps:
           - action: aws:runShellScript
             name: installAwsCli
@@ -758,12 +770,7 @@ Resources:
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
                 - dnf install -y unzip
-                - |
-                  if [ "$AWSCLI_VERSION" = "latest" ]; then
-                    ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH.zip"
-                  else
-                    ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH-$AWSCLI_VERSION.zip"
-                  fi
+                - ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH-$AWSCLI_VERSION.zip"
                 - TMP_DIR=$(mktemp -d)
                 - curl -sSfL "https://awscli.amazonaws.com/$ZIP_NAME" -o "$TMP_DIR/awscliv2.zip"
                 - unzip -q "$TMP_DIR/awscliv2.zip" -d "$TMP_DIR"
@@ -959,13 +966,16 @@ Resources:
 
   # Per-major-version associations. All k6 majors share one tag key and
   # differ by tag VALUE, so a server matches at most one of them; switching
-  # the value and re-applying replaces /usr/local/bin/k6. No Parameters: the
-  # document default ("latest" within its major) governs.
+  # the value and re-applying replaces /usr/local/bin/k6. Each passes its
+  # pinned version from the matching environment stack parameter.
   K6V0ConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: !Sub "${AWS::StackName}-k6-v0"
       Name: !Ref AmazonLinuxK6V0Document
+      Parameters:
+        K6Version:
+          - !Ref K6V0Version
       Targets:
         - Key: "tag:CloudDevK6Config"
           Values:
@@ -976,6 +986,9 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-k6-v1"
       Name: !Ref AmazonLinuxK6V1Document
+      Parameters:
+        K6Version:
+          - !Ref K6V1Version
       Targets:
         - Key: "tag:CloudDevK6Config"
           Values:
@@ -986,6 +999,9 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-awscli-v2"
       Name: !Ref AmazonLinuxAwsCliV2Document
+      Parameters:
+        AwsCliVersion:
+          - !Ref AwsCliV2Version
       Targets:
         - Key: "tag:CloudDevAwsCliConfig"
           Values:
@@ -1337,7 +1353,7 @@ Outputs:
   AmazonLinuxK6V0DocumentName:
     Description: >-
       Name of the shared SSM Command Document that installs k6 0.x
-      (K6Version parameter, default latest 0.x) on Amazon Linux dev servers.
+      (K6Version parameter) on Amazon Linux dev servers.
     Value: !Ref AmazonLinuxK6V0Document
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxK6V0DocumentName"
@@ -1345,7 +1361,7 @@ Outputs:
   AmazonLinuxK6V1DocumentName:
     Description: >-
       Name of the shared SSM Command Document that installs k6 1.x
-      (K6Version parameter, default latest 1.x) on Amazon Linux dev servers.
+      (K6Version parameter) on Amazon Linux dev servers.
     Value: !Ref AmazonLinuxK6V1Document
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxK6V1DocumentName"
@@ -1353,7 +1369,7 @@ Outputs:
   AmazonLinuxAwsCliV2DocumentName:
     Description: >-
       Name of the shared SSM Command Document that installs AWS CLI 2.x
-      (AwsCliVersion parameter, default latest 2.x) on Amazon Linux dev servers.
+      (AwsCliVersion parameter) on Amazon Linux dev servers.
     Value: !Ref AmazonLinuxAwsCliV2Document
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxAwsCliV2DocumentName"

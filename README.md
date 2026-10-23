@@ -86,8 +86,8 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
 
 The .NET SDK installs into `/opt/dotnet` (via Microsoft's `dotnet-install.sh`,
 x64 or arm64 automatically), with `/usr/bin/dotnet` symlinked and `DOTNET_ROOT`
-set in `/etc/profile.d/dotnet.sh`. `DotNet8Version` / `DotNet10Version` accept
-a channel (`8.0`, newest SDK) or an exact SDK (`8.0.415`). Pin a project to a
+set in `/etc/profile.d/dotnet.sh`. `DotNet8Version` / `DotNet10Version` are
+exact SDK versions (`8.0.426`). Pin a project to a
 specific SDK with `global.json`; `dotnet --list-sdks` shows what is installed.
 
 The Playwright document installs the OS dependencies (the dnf equivalent of
@@ -103,29 +103,29 @@ Playwright's WebKit and Firefox builds target Ubuntu.
 Tools whose version matters to a project (PowerShell, .NET, k6, the AWS CLI)
 follow one pattern: **one SSM document per tool per major version** (PowerShell:
 per release line), for example `AmazonLinuxK6V0Document` and
-`AmazonLinuxK6V1Document`. PowerShell (7.4, 7.6) and .NET (8, 10) differ from
-k6/AWS CLI in one way: their documents have **no `latest` default**; the exact
-version comes from a required environment-stack parameter
-(`PowerShell74Version`, `PowerShell76Version`, `DotNet8Version`,
-`DotNet10Version`) that the association passes in.
+`AmazonLinuxK6V1Document`. Nothing floats to `latest`: every document takes an
+**exact version** with no default of its own, and the association passes it in
+from a pinned environment-stack parameter (`PowerShell74Version`,
+`PowerShell76Version`, `DotNet8Version`, `DotNet10Version`, `K6V0Version`,
+`K6V1Version`, `AwsCliV2Version`).
 
-- The document fixes the major version. Its version parameter (`K6Version`,
-  `AwsCliVersion`) defaults to `latest`, the newest release **within that
-  major**, and also accepts an exact version (`0.55.0`), checked against the
-  major by `allowedPattern`.
+- The document fixes the major version. Its version parameter (`PowerShellVersion`,
+  `DotNetVersion`, `K6Version`, `AwsCliVersion`) takes an exact version
+  (`0.59.0`), checked against the major by `allowedPattern`.
 - Each major has its own association. All majors of a tool share one tag key
   and differ by tag **value**, so a server selects exactly one major
   (`CloudDevK6Config = v0`), and `none` selects nothing. Server stacks expose
   this as `K6MajorVersion` / `AwsCliMajorVersion`.
 - To add a major, copy the document and association, change the major number,
   and add the value to the server stacks' `AllowedValues`.
-- Re-applying an association upgrades to the newest release in that major.
-  Changing a server's tag value and re-applying switches majors.
+- To roll the fleet to a new release, change the pinned parameter on the
+  environment stack and re-apply the association. Changing a server's tag value
+  and re-applying switches majors.
 
 To pin an exact version on one server, run the document with Run Command:
 
 ```bash
-aws ssm send-command --instance-ids <instance-id>   --document-name <AmazonLinuxK6V0DocumentName output>   --parameters K6Version=0.55.0
+aws ssm send-command --instance-ids <instance-id>   --document-name <AmazonLinuxK6V0DocumentName output>   --parameters K6Version=0.58.0
 ```
 
 The AWS CLI document installs AWS's official v2 build at `/usr/local/bin/aws`,
@@ -145,15 +145,18 @@ packages.
 
 ### Fleet-wide software versions
 
-Node and PowerShell versions are set **once, on the environment stack**, and
-flow into the SSM documents' parameter defaults:
+Software versions are set **once, on the environment stack**, as exact pinned
+defaults (current as of October 2026), so every server gets the same release:
 
 - `DefaultNodeVersion` (default `24`) — Node.js major version (22 / 24 / 26)
-- `PowerShell74Version`, `PowerShell76Version`, `DotNet8Version`,
-  `DotNet10Version`, `PlaywrightVersion` — **no defaults**; you must set each
-  at deploy time. Servers only choose *which* PowerShell/.NET line to install
-  (`PowerShellVersion`, `DotNetVersion` dropdowns); the exact release is
-  fleet-wide.
+- `PowerShell74Version` (`7.4.21`), `PowerShell76Version` (`7.6.8`, LTS)
+- `DotNet8Version` (`8.0.426`), `DotNet10Version` (`10.0.402`)
+- `PlaywrightVersion` (`1.64.1`)
+- `K6V0Version` (`0.59.0`), `K6V1Version` (`1.8.2`), `AwsCliV2Version` (`2.38.5`)
+
+Servers only choose *which* line to install (`PowerShellVersion`,
+`DotNetVersion`, `K6MajorVersion`, `AwsCliMajorVersion` dropdowns); the exact
+release is fleet-wide.
 
 Server stacks do not take an exact version. Changing the fleet version means
 updating the environment stack and re-applying the association on existing
@@ -316,11 +319,14 @@ A truly idle box you are connected to will still stop after the window — raise
 | `StackNamePrefix` | `CloudDev` | Scopes which stacks the shared role may signal |
 | `LogRetentionDays` | `7` | Bootstrap log retention |
 | `DefaultNodeVersion` | `24` | Fleet-wide Node.js version |
-| `PowerShell74Version` | *(required)* | Exact PowerShell 7.4.x release |
-| `PowerShell76Version` | *(required)* | Exact PowerShell 7.6.x release |
-| `DotNet8Version` | *(required)* | .NET 8 channel (`8.0`) or exact SDK |
-| `DotNet10Version` | *(required)* | .NET 10 channel (`10.0`) or exact SDK |
-| `PlaywrightVersion` | *(required)* | Playwright version to install Chromium for |
+| `PowerShell74Version` | `7.4.21` | Exact PowerShell 7.4.x release |
+| `PowerShell76Version` | `7.6.8` | Exact PowerShell 7.6.x release |
+| `DotNet8Version` | `8.0.426` | Exact .NET 8 SDK |
+| `DotNet10Version` | `10.0.402` | Exact .NET 10 SDK |
+| `PlaywrightVersion` | `1.64.1` | Playwright version to install Chromium for |
+| `K6V0Version` | `0.59.0` | Exact k6 0.x release |
+| `K6V1Version` | `1.8.2` | Exact k6 1.x release |
+| `AwsCliV2Version` | `2.38.5` | Exact AWS CLI 2.x release |
 | `VpcMode` | `none` | `none` / `public` / `public-private` |
 | `AzCount` | `1` | Availability Zones (1–3) when a VPC is created |
 | `VpcCidr` | `10.0.0.0/16` | VPC CIDR when a VPC is created |
