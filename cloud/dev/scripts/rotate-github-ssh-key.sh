@@ -9,13 +9,14 @@
 # Defaults: the instance this script runs on (from instance metadata), keep 2
 # keys, the region from instance metadata or AWS_REGION, and the document found
 # by name. Run it anywhere your AWS credentials allow ssm:SendCommand on the
-# document and the instance (the CloudDev permission set does). A server's own
-# role does not, so on a server use a profile (-p) from ~/.aws/credentials.
+# document and the instance: the CloudDev permission set does, and so does the
+# shared dev server role (for servers of its own environment), so on a server
+# no profile is needed. -p selects another profile.
 set -euo pipefail
 
 INSTANCE="" KEEP=2 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" DOC="${DOC:-}" PROFILE_ARGS=()
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while getopts "i:k:r:p:d:h" opt; do
   case "$opt" in

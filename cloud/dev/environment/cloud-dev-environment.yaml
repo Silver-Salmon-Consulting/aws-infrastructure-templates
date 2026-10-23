@@ -527,6 +527,33 @@ Resources:
               - Effect: Allow
                 Action: cloudformation:SignalResource
                 Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackNamePrefix}*/*"
+        # Lets a dev server run the GitHub document (key rotation) on dev
+        # servers of this environment, so rotate-github-key needs no extra
+        # AWS credentials. SendCommand is checked against the document and the
+        # target instance separately. Scoped to the one document and to
+        # instances tagged CloudDevEnvironment=<this stack>; it is not limited
+        # to the calling instance, because every dev server shares this role.
+        - PolicyName: RotateGitHubSshKey
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${AmazonLinuxGhCliV2Document}"
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/CloudDevEnvironment: !Ref AWS::StackName
+              # Find the document by name and follow the command. These
+              # read-only calls do not support resource-level permissions.
+              - Effect: Allow
+                Action:
+                  - ssm:ListDocuments
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: "*"
         - PolicyName: WriteBootstrapLogs
           PolicyDocument:
             Version: "2012-10-17"
