@@ -133,6 +133,9 @@ aws ssm send-command --instance-ids <instance-id>   --document-name <AmazonLinux
 The AWS CLI document installs AWS's official v2 build at `/usr/local/bin/aws`,
 which comes first on PATH. It leaves the AL2023 `awscli-2` RPM
 (`/usr/bin/aws`) in place, because UserData uses it to signal CloudFormation.
+It also creates an empty `~/.aws/credentials` for `ec2-user` (mode `600`, in a
+`700` directory) if none exists, ready for you to fill in; an existing file is
+never overwritten, and an empty file does not stop the CLI using the instance role.
 Small unversioned utilities (jq, zip, unzip) come from dnf through the base
 tools document.
 

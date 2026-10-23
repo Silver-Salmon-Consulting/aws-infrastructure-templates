@@ -805,6 +805,15 @@ Resources:
                 - '"$TMP_DIR/aws/install" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin --update'
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/aws --version
+                # Start ec2-user with an empty ~/.aws/credentials so it is
+                # ready to fill in. Never overwrite an existing file, so
+                # re-runs keep any credentials already added. With no profile
+                # defined in it, the CLI still uses the instance role.
+                - mkdir -p /home/ec2-user/.aws
+                - touch /home/ec2-user/.aws/credentials
+                - chown -R ec2-user:ec2-user /home/ec2-user/.aws
+                - chmod 700 /home/ec2-user/.aws
+                - chmod 600 /home/ec2-user/.aws/credentials
 
   # GitHub document: installs the GitHub CLI 2.x AND rotates the GitHub SSH
   # key, selected by the Action parameter (steps are skipped by precondition).
