@@ -457,9 +457,10 @@ default) and none of this is created.
   on every stop/start, which is why the record is refreshed on each start.
 - On `stopped` or `terminated` it deletes the record, so DNS never points at an
   address that may belong to someone else.
-- `<label>` is the instance's `DnsName` tag if you set one, otherwise its
-  CloudFormation stack name, lowercased with other characters turned into `-`
-  (stack `CloudDev-Music-Arm-2` in zone `dev.example.com` becomes
+- `<label>` is the server stack's optional `DnsName` parameter (stored as the
+  instance's `DnsName` tag) if you set one, otherwise the CloudFormation stack
+  name, lowercased with other characters turned into `-` (stack
+  `CloudDev-Music-Arm-2` in zone `dev.example.com` becomes
   `clouddev-music-arm-2.dev.example.com`).
 - It only touches instances tagged `CloudDevEnvironment=<this environment stack>`,
   and its role can change records in that one zone only. The instances need no
@@ -467,6 +468,12 @@ default) and none of this is created.
   and skipped.
 
 Logs are in `/clouddev/<environment-stack>/dns-registrar` in CloudWatch Logs.
+
+To turn it on, update the environment stack with your zone ID, for example
+`HostedZoneId=Z055297224GATXGNE59WY` (zone `clouddev.silversalmon.com`). Servers
+that are already running get their record the next time they start; to register one
+that is running now, stop and start it. The record is removed when the server
+stops, so use the name only while the server is up.
 
 ## Environment stack parameters (summary)
 
