@@ -403,6 +403,31 @@ holding a quiet box up, and keeps a busy download from being stopped. The instan
 A truly idle box you are connected to will still stop after the window — raise
 `IdleStopPeriods` or set `EnableIdleShutdown=false` if that is a problem.
 
+## DNS for dev servers (optional)
+
+Set the environment stack's `HostedZoneId` (a Route 53 zone in the same account)
+and each dev server gets an A record for its public IP. Leave it empty (the
+default) and none of this is created.
+
+- An EventBridge rule sends EC2 `running`, `stopped` and `terminated` events to a
+  Lambda (`DnsRegistrarFunction`; its `HOSTED_ZONE_ID` environment variable is the
+  parameter, and it does nothing if that is empty).
+- On `running` it UPSERTs `<label>.<zone name>` with a 60-second TTL and the
+  instance's public IP. These servers have no Elastic IP, so the address changes
+  on every stop/start, which is why the record is refreshed on each start.
+- On `stopped` or `terminated` it deletes the record, so DNS never points at an
+  address that may belong to someone else.
+- `<label>` is the instance's `DnsName` tag if you set one, otherwise its
+  CloudFormation stack name, lowercased with other characters turned into `-`
+  (stack `CloudDev-Music-Arm-2` in zone `dev.example.com` becomes
+  `clouddev-music-arm-2.dev.example.com`).
+- It only touches instances tagged `CloudDevEnvironment=<this environment stack>`,
+  and its role can change records in that one zone only. The instances need no
+  Route 53 permission. An instance with no public IP (private subnet) is logged
+  and skipped.
+
+Logs are in `/clouddev/<environment-stack>/dns-registrar` in CloudWatch Logs.
+
 ## Environment stack parameters (summary)
 
 | Parameter | Default | Purpose |
@@ -420,6 +445,7 @@ A truly idle box you are connected to will still stop after the window — raise
 | `AwsCliV2Version` | `2.38.5` | Exact AWS CLI 2.x release |
 | `GhCliV2Version` | `2.103.0` | Exact GitHub CLI 2.x release |
 | `DefaultNpmVersion` | `12.2.1` | Exact npm version |
+| `HostedZoneId` | *(empty)* | Optional Route 53 zone; registers DNS for each server (see [DNS](#dns-for-dev-servers-optional)) |
 | `VpcMode` | `none` | `none` / `public` / `public-private` |
 | `AzCount` | `1` | Availability Zones (1–3) when a VPC is created |
 | `VpcCidr` | `10.0.0.0/16` | VPC CIDR when a VPC is created |

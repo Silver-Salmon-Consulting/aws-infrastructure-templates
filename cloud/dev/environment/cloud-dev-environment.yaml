@@ -19,6 +19,10 @@ Metadata:
           - StackNamePrefix
           - LogRetentionDays
       - Label:
+          default: DNS (optional)
+        Parameters:
+          - HostedZoneId
+      - Label:
           default: Networking
         Parameters:
           - VpcMode
@@ -44,6 +48,8 @@ Metadata:
         default: Stack name prefix
       LogRetentionDays:
         default: Bootstrap log retention (days)
+      HostedZoneId:
+        default: Route 53 hosted zone ID (optional)
       DefaultNodeVersion:
         default: Default Node.js version
       DefaultNpmVersion:
@@ -104,6 +110,19 @@ Parameters:
       - 30
       - 60
       - 90
+
+  HostedZoneId:
+    Type: String
+    Description: >-
+      Optional Route 53 hosted zone ID (in this account). When set, an
+      EventBridge rule and Lambda register an A record for each dev server's
+      public IP when it reaches "running" and delete it when it stops or is
+      terminated. The record is <label>.<zone name>, where label is the
+      instance's DnsName tag if present, else its CloudFormation stack name,
+      lowercased. Leave empty to create none of this.
+    Default: ""
+    AllowedPattern: ^(Z[A-Z0-9]+)?$
+    ConstraintDescription: Must be empty or a hosted zone ID such as Z0123456789ABCDEFGHIJ.
 
   DefaultNodeVersion:
     Type: String
@@ -268,6 +287,7 @@ Parameters:
 # Conditions
 # ---------------------------------------------------------------------------
 Conditions:
+  DnsEnabled: !Not [!Equals [!Ref HostedZoneId, ""]]
   CreateVpc: !Not [!Equals [!Ref VpcMode, none]]
   CreatePrivate: !Equals [!Ref VpcMode, public-private]
   TwoAzs: !Or [!Equals [!Ref AzCount, 2], !Equals [!Ref AzCount, 3]]
@@ -290,6 +310,196 @@ Resources:
     Properties:
       LogGroupName: !Sub "/clouddev/${AWS::StackName}/bootstrap"
       RetentionInDays: !Ref LogRetentionDays
+
+  # ---- Optional DNS registration (created only when HostedZoneId is set) ----
+  # EventBridge delivers EC2 state-change events to a Lambda that keeps one A
+  # record per dev server in the hosted zone: UPSERT the public IP on
+  # "running", DELETE the record on "stopped"/"terminated". The instances need
+  # no Route 53 permission. Only instances tagged CloudDevEnvironment=<this
+  # stack> are touched, and the function can only change records in this zone.
+  DnsRegistrarLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DnsEnabled
+    Properties:
+      LogGroupName: !Sub "/clouddev/${AWS::StackName}/dns-registrar"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DnsRegistrarRole:
+    Type: AWS::IAM::Role
+    Condition: DnsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DnsRegistrar
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Resource: !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt DnsRegistrarLogGroup.Arn
+
+  DnsRegistrarFunction:
+    Type: AWS::Lambda::Function
+    Condition: DnsEnabled
+    Properties:
+      Description: Registers a Route 53 A record for each CloudDev server's public IP.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt DnsRegistrarRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref DnsRegistrarLogGroup
+      Environment:
+        Variables:
+          HOSTED_ZONE_ID: !Ref HostedZoneId
+          ENVIRONMENT_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import re
+          import time
+
+          import boto3
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          ec2 = boto3.client("ec2")
+          r53 = boto3.client("route53")
+
+          TTL = 60
+
+
+          def label_for(instance):
+              tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+              raw = tags.get("DnsName") or tags.get("aws:cloudformation:stack-name") or instance["InstanceId"]
+              return re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
+
+
+          def describe(instance_id):
+              resp = ec2.describe_instances(InstanceIds=[instance_id])
+              return resp["Reservations"][0]["Instances"][0]
+
+
+          def current_record(zone_id, name):
+              resp = r53.list_resource_record_sets(
+                  HostedZoneId=zone_id, StartRecordName=name, StartRecordType="A", MaxItems="1"
+              )
+              for rec in resp["ResourceRecordSets"]:
+                  if rec["Name"].rstrip(".") == name.rstrip(".") and rec["Type"] == "A":
+                      return rec
+              return None
+
+
+          def handler(event, context):
+              zone_id = os.environ.get("HOSTED_ZONE_ID", "")
+              environment = os.environ.get("ENVIRONMENT_NAME", "")
+              if not zone_id:
+                  log.info("HOSTED_ZONE_ID is not set; nothing to do")
+                  return
+              detail = event["detail"]
+              instance_id, state = detail["instance-id"], detail["state"]
+              log.info("event: instance=%s state=%s", instance_id, state)
+
+              try:
+                  instance = describe(instance_id)
+              except Exception as exc:
+                  log.error("cannot describe %s: %s", instance_id, exc)
+                  return
+              tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+              if tags.get("CloudDevEnvironment") != environment:
+                  log.info("%s is not a %s dev server; ignoring", instance_id, environment)
+                  return
+
+              zone_name = r53.get_hosted_zone(Id=zone_id)["HostedZone"]["Name"].rstrip(".")
+              name = "%s.%s" % (label_for(instance), zone_name)
+
+              if state == "running":
+                  ip = instance.get("PublicIpAddress")
+                  for _ in range(6):
+                      if ip:
+                          break
+                      time.sleep(5)
+                      ip = describe(instance_id).get("PublicIpAddress")
+                  if not ip:
+                      log.warning("%s has no public IP; not registering %s", instance_id, name)
+                      return
+                  r53.change_resource_record_sets(
+                      HostedZoneId=zone_id,
+                      ChangeBatch={
+                          "Comment": "CloudDev %s running" % instance_id,
+                          "Changes": [{
+                              "Action": "UPSERT",
+                              "ResourceRecordSet": {
+                                  "Name": name, "Type": "A", "TTL": TTL,
+                                  "ResourceRecords": [{"Value": ip}],
+                              },
+                          }],
+                      },
+                  )
+                  log.info("UPSERT %s A %s", name, ip)
+              elif state in ("stopped", "terminated"):
+                  rec = current_record(zone_id, name)
+                  if not rec:
+                      log.info("no A record %s to delete", name)
+                      return
+                  r53.change_resource_record_sets(
+                      HostedZoneId=zone_id,
+                      ChangeBatch={
+                          "Comment": "CloudDev %s %s" % (instance_id, state),
+                          "Changes": [{"Action": "DELETE", "ResourceRecordSet": rec}],
+                      },
+                  )
+                  log.info("DELETE %s A", name)
+              else:
+                  log.info("state %s ignored", state)
+
+  DnsRegistrarRule:
+    Type: AWS::Events::Rule
+    Condition: DnsEnabled
+    Properties:
+      Description: Send EC2 running/stopped/terminated events to the DNS registrar.
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - EC2 Instance State-change Notification
+        detail:
+          state:
+            - running
+            - stopped
+            - terminated
+      Targets:
+        - Id: DnsRegistrar
+          Arn: !GetAtt DnsRegistrarFunction.Arn
+
+  DnsRegistrarInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: DnsEnabled
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DnsRegistrarFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DnsRegistrarRule.Arn
 
   # IAM role that lets AWS Systems Manager manage dev instances (Session
   # Manager, Run Command, Patch Manager, etc.). AmazonSSMManagedInstanceCore is
