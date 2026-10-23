@@ -278,6 +278,23 @@ aws cloudformation deploy \
 Use the ARM template (`...-arm.yaml`) for a Graviton instance; it is otherwise
 identical.
 
+**The stack name must start with the environment stack's `StackNamePrefix`**
+(default `CloudDev`). The instance signals CloudFormation from UserData, and the
+dev server role may only signal stacks named `<prefix>*`. With any other name the
+signal is denied, the instance still boots, and the stack fails after the
+`CreationPolicy` timeout (15 minutes; 30 for the Ollama server) with "Failed to
+receive 1 resource signal(s)". The server templates import the prefix
+(`<environment-stack>-StackNamePrefix`) and log the problem at boot, so update the
+environment stack **before** deploying a server stack from these templates.
+
+Bootstrap signalling is logged as `[cfn-signal <time>]` lines to
+`/var/log/cloud-init-output.log` (streamed to the bootstrap CloudWatch log group),
+the journal (`journalctl -t cfn-signal`) and the EC2 console output (Actions >
+Monitor and troubleshoot > Get system log). They record the stack, instance, AWS
+CLI version and caller identity, whether the stack name matches the prefix, and
+each signal attempt with its full error. To debug a failed create without
+losing the instance, deploy with `--disable-rollback`.
+
 The instance reaches `CREATE_COMPLETE` once it boots and signals — **before**
 Node/PowerShell finish installing. Those install asynchronously via SSM State
 Manager after the instance registers; check their status in SSM association

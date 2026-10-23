@@ -345,24 +345,73 @@ Resources:
               # Signal CloudFormation using the AWS CLI (preinstalled on Amazon
               # Linux 2023), rather than cfn-signal / aws-cfn-bootstrap which is not
               # installed on AL2023 and is fragile to install via pip. The trap is
-              # set BEFORE any package install so that even a dnf failure reports a
+              # set BEFORE any package install so that even a failure reports a
               # FAILURE signal instead of letting the stack wait out its timeout.
               REGION="${AWS::Region}"
+              STACK_NAME="${AWS::StackName}"
+              STACK_PREFIX="${StackNamePrefix}"
+
+              # Everything below is logged with a timestamp to cloud-init-output.log
+              # (streamed to the bootstrap CloudWatch log group), the journal and the
+              # EC2 console output, so a signalling problem can be diagnosed without
+              # logging in.
+              log() {
+                local line="[cfn-signal $(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+                echo "$line"
+                logger -t cfn-signal -- "$*" || true
+                echo "$line" > /dev/console 2>/dev/null || true
+              }
+
               TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
                 -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
               INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
                 http://169.254.169.254/latest/meta-data/instance-id)
 
+              log "stack=$STACK_NAME resource=DevServerInstance instance=$INSTANCE_ID region=$REGION"
+              log "aws cli: $(command -v aws || echo not-found) $(aws --version 2>&1 || true)"
+              log "caller identity: $(aws sts get-caller-identity --query Arn --output text 2>&1 || true)"
+
+              # Preflight: the dev server role may only signal stacks whose name starts
+              # with the environment stack's StackNamePrefix. Check it now and say so
+              # loudly, because otherwise the denied signal is only visible after the
+              # CreationPolicy timeout.
+              case "$STACK_NAME" in
+                "$STACK_PREFIX"*)
+                  log "stack name matches the environment StackNamePrefix '$STACK_PREFIX'; signalling is permitted"
+                  ;;
+                *)
+                  log "ERROR: stack name '$STACK_NAME' does not start with the environment StackNamePrefix '$STACK_PREFIX'."
+                  log "ERROR: the dev server role is not allowed to signal this stack, so CloudFormation will fail it after the CreationPolicy timeout. Delete the stack and recreate it with a name starting with '$STACK_PREFIX'."
+                  ;;
+              esac
+
               signal_cfn() {
-                local status="$1"
-                aws cloudformation signal-resource \
-                  --stack-name "${AWS::StackName}" \
-                  --logical-resource-id DevServerInstance \
-                  --unique-id "$INSTANCE_ID" \
-                  --status "$status" \
-                  --region "$REGION" || true
+                local status="$1" out rc attempt
+                for attempt in 1 2 3; do
+                  rc=0
+                  out=$(aws cloudformation signal-resource \
+                    --stack-name "$STACK_NAME" \
+                    --logical-resource-id DevServerInstance \
+                    --unique-id "$INSTANCE_ID" \
+                    --status "$status" \
+                    --region "$REGION" 2>&1) || rc=$?
+                  if [ "$rc" -eq 0 ]; then
+                    log "sent $status signal to $STACK_NAME (attempt $attempt)"
+                    return 0
+                  fi
+                  log "signal-resource $status failed (attempt $attempt, exit $rc): $out"
+                  case "$out" in
+                    *AccessDenied*|*"not authorized"*)
+                      log "ERROR: access denied signalling $STACK_NAME. The role only allows stacks named '$STACK_PREFIX*'; check the stack name and the role's SignalCreationStatus policy."
+                      break
+                      ;;
+                  esac
+                  sleep 5
+                done
+                log "ERROR: could not deliver the $status signal; CloudFormation will fail this resource when the CreationPolicy times out."
+                return 0
               }
-              trap '[ $? -eq 0 ] && signal_cfn SUCCESS || signal_cfn FAILURE' EXIT
+              trap 'rc=$?; log "bootstrap script exiting with status $rc"; if [ "$rc" -eq 0 ]; then signal_cfn SUCCESS; else signal_cfn FAILURE; fi' EXIT
 
               # NOTE: no package installs here. UserData only needs to start the
               # CloudWatch agent and signal CloudFormation; it compiles nothing.
@@ -417,6 +466,8 @@ Resources:
               # separately as SSM State Manager compliance.
             - BootstrapLogGroupName:
                 Fn::ImportValue: !Sub "${EnvironmentStackName}-BootstrapLogGroupName"
+              StackNamePrefix:
+                Fn::ImportValue: !Sub "${EnvironmentStackName}-StackNamePrefix"
     CreationPolicy:
       ResourceSignal:
         Timeout: PT15M

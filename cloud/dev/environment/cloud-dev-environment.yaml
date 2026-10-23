@@ -1448,6 +1448,15 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-BootstrapLogGroupName"
 
+  StackNamePrefixOutput:
+    Description: >-
+      Stack-name prefix the dev server role may signal. Server stacks import
+      it to check their own name at boot and log a clear error if it does not
+      match.
+    Value: !Ref StackNamePrefix
+    Export:
+      Name: !Sub "${AWS::StackName}-StackNamePrefix"
+
   BootstrapLogGroupArn:
     Description: ARN of the shared bootstrap CloudWatch log group.
     Value: !GetAtt BootstrapLogGroup.Arn
