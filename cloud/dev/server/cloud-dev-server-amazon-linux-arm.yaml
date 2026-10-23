@@ -494,9 +494,14 @@ Resources:
               trap 'log "ERROR: command failed (exit $?) at line $LINENO: $BASH_COMMAND"' ERR
               trap 'rc=$?; log "bootstrap script exiting with status $rc"; if [ "$rc" -eq 0 ]; then signal_cfn SUCCESS; else ship_failure_log; signal_cfn FAILURE; fi' EXIT
 
-              # Base tooling useful on a dev box.
-              dnf update -y
-              dnf install -y git tar gzip gcc-c++ make
+              # NOTE: no package installs here. UserData only needs to start the
+              # CloudWatch agent and signal CloudFormation. Build tooling (git,
+              # gcc-c++, make) and Node are installed by the shared SSM
+              # document, applied via the tag-targeted association in the
+              # environment stack. A dnf update/install here ran at the same
+              # time as those associations (dnf lock and package cache
+              # contention) and intermittently failed the script, which sent a
+              # FAILURE signal for a healthy instance.
 
               # Best-effort CloudWatch agent so this bootstrap script's output
               # (cloud-init-output.log) streams to CloudWatch Logs for easier
