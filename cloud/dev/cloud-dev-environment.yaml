@@ -1180,8 +1180,10 @@ Resources:
   # Provider is the server's SourceProvider (its CloudDevSourceProvider tag)
   # unless set explicitly.
   #  - Setup (default): installs the rotate-git-key helper into
-  #    /usr/local/bin (rotate-github-key is kept as a link to it) and creates
-  #    the code directory for ec2-user. This is what the association runs.
+  #    /usr/local/bin (rotate-github-key is kept as a link to it), creates
+  #    the code directory for ec2-user and sets ec2-user's git user.name /
+  #    user.email from the CloudDevGitUserName / CloudDevGitUserEmail tags
+  #    when present. This is what the association runs.
   #  - RotateSshKey: on-demand, run it from Run Command, the CLI or
   #    rotate-git-key; the association never runs it. Generates a new key for
   #    ec2-user in ~/.ssh/<provider>/ (the private key never leaves the
@@ -1202,8 +1204,9 @@ Resources:
         schemaVersion: "2.2"
         description: >-
           Git source control on Amazon Linux dev servers (GitHub or Azure
-          DevOps). Action=Setup installs the rotate-git-key helper and creates
-          the code directory for ec2-user; Action=RotateSshKey generates a new
+          DevOps). Action=Setup installs the rotate-git-key helper, creates
+          the code directory for ec2-user and sets its git user.name /
+          user.email from the server's tags; Action=RotateSshKey generates a new
           SSH key for ec2-user (ed25519 for GitHub, ssh-rsa for Azure DevOps)
           and prints the public key to add.
         parameters:
@@ -1443,6 +1446,18 @@ Resources:
                   mkdir -p "$CODE_DIR"
                   chown ec2-user:ec2-user "$CODE_DIR"
                   chmod 0755 "$CODE_DIR"
+
+                  # Git identity for ec2-user from the server stack's GitUserName /
+                  # GitUserEmail (the CloudDevGitUserName / CloudDevGitUserEmail tags).
+                  # An absent tag leaves that setting alone. git normally comes with
+                  # the Node document, which may not have run yet.
+                  GIT_NAME=$(tag CloudDevGitUserName)
+                  GIT_EMAIL=$(tag CloudDevGitUserEmail)
+                  if [ -n "$GIT_NAME$GIT_EMAIL" ]; then
+                    command -v git > /dev/null || dnf install -y git
+                    [ -z "$GIT_NAME" ] || sudo -u ec2-user -H git config --global user.name "$GIT_NAME"
+                    [ -z "$GIT_EMAIL" ] || sudo -u ec2-user -H git config --global user.email "$GIT_EMAIL"
+                  fi
 
   # Automation runbooks that let developers start, stop and restart a dev
   # server from Systems Manager > Automation > Execute. No AssumeRole is set,

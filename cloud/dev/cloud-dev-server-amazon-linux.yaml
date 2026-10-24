@@ -45,7 +45,12 @@ Metadata:
           - DotNetVersion
           - K6MajorVersion
           - AwsCliMajorVersion
+      - Label:
+          default: Source control
+        Parameters:
           - SourceProvider
+          - GitUserName
+          - GitUserEmail
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
@@ -87,6 +92,10 @@ Metadata:
         default: AWS CLI (official installer) major version
       SourceProvider:
         default: Source control provider
+      GitUserName:
+        default: Git user.name (optional)
+      GitUserEmail:
+        default: Git user.email (optional)
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -319,6 +328,31 @@ Parameters:
       - AzureDevOps
       - none
 
+
+  # Passed to the instance as the CloudDevGitUserName / CloudDevGitUserEmail
+  # tags, so the patterns only allow characters EC2 tag values accept.
+  GitUserName:
+    Type: String
+    Description: >-
+      Optional. Git user.name for ec2-user (git config --global), applied by
+      the source control setup, so it needs a SourceProvider other than
+      "none". Leave empty to leave user.name alone.
+    Default: ""
+    AllowedPattern: ^[\p{L}\p{N} ._:/=+@-]{0,256}$
+    ConstraintDescription: >-
+      Must be at most 256 letters, digits, spaces and . _ : / = + @ -
+      (the characters EC2 tag values allow).
+
+
+  GitUserEmail:
+    Type: String
+    Description: >-
+      Optional. Git user.email for ec2-user (git config --global), applied
+      like GitUserName. Leave empty to leave user.email alone.
+    Default: ""
+    AllowedPattern: ^([A-Za-z0-9._+-]+@[A-Za-z0-9.-]+)?$
+    ConstraintDescription: Must be empty or an email address, e.g. dev@example.com.
+
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
@@ -330,6 +364,8 @@ Conditions:
   PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
   UsesGitHub: !Equals [!Ref SourceProvider, GitHub]
   UsesAzureDevOps: !Equals [!Ref SourceProvider, AzureDevOps]
+  HasGitUserName: !Not [!Equals [!Ref GitUserName, ""]]
+  HasGitUserEmail: !Not [!Equals [!Ref GitUserEmail, ""]]
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -424,6 +460,18 @@ Resources:
           Value: !If [UsesGitHub, v2, none]
         - Key: CloudDevAzCliConfig
           Value: !If [UsesAzureDevOps, v2, none]
+        # Git identity for ec2-user, applied by the source control setup.
+        # Tag values cannot be empty, so each tag is left off when unset.
+        - !If
+          - HasGitUserName
+          - Key: CloudDevGitUserName
+            Value: !Ref GitUserName
+          - !Ref AWS::NoValue
+        - !If
+          - HasGitUserEmail
+          - Key: CloudDevGitUserEmail
+            Value: !Ref GitUserEmail
+          - !Ref AWS::NoValue
       UserData:
         Fn::Base64:
           Fn::Sub:

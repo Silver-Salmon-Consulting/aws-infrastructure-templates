@@ -88,6 +88,8 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `CloudDevSourceProvider = <SourceProvider>` (`GitHub` / `AzureDevOps` /
      `none`, default `GitHub`), plus `CloudDevGhCliConfig = v2` for GitHub or
      `CloudDevAzCliConfig = v2` for Azure DevOps (`none` otherwise)
+   - `CloudDevGitUserName = <GitUserName>` and `CloudDevGitUserEmail =
+     <GitUserEmail>`, each only when set (default empty)
 
 The .NET SDK installs into `/opt/dotnet` (via Microsoft's `dotnet-install.sh`,
 x64 or arm64 automatically), with `/usr/bin/dotnet` symlinked and `DOTNET_ROOT`
@@ -203,9 +205,11 @@ a link to it). git itself comes with the Node document. `none` sets up neither.
 Three documents do this:
 
 - **`AmazonLinuxSourceControlDocument`** (provider-neutral). `Action=Setup` (run
-  by its association on every server with a provider) installs `rotate-git-key`
-  and creates the code directory (override with `CodeDirectory`; existing
-  contents are never touched). `Action=RotateSshKey` is **on demand only**;
+  by its association on every server with a provider) installs `rotate-git-key`,
+  creates the code directory (override with `CodeDirectory`; existing
+  contents are never touched) and sets `ec2-user`'s global git `user.name` /
+  `user.email` from the stack's optional **`GitUserName`** / **`GitUserEmail`**
+  (an empty one is left alone). `Action=RotateSshKey` is **on demand only**;
   nothing runs it automatically.
 - **`AmazonLinuxGhCliV2Document`** installs `gh` (`CloudDevGhCliConfig = v2`).
 - **`AmazonLinuxAzCliV2Document`** installs `az` from Microsoft's RHEL 9 RPM
@@ -215,6 +219,12 @@ Three documents do this:
 
 Changing `SourceProvider` on an existing server switches which CLI the
 associations target; the other CLI stays installed until you remove it.
+
+Changing `GitUserName` / `GitUserEmail` on an existing server updates its tags
+only; the association does not re-run on a tag change. Apply it with **Systems
+Manager > State Manager > `<env>-source-control` > Apply association now**, or
+run `git config --global` yourself. Clearing a value leaves the old setting in
+place.
 
 #### Signing in to the CLI (optional)
 
