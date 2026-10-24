@@ -235,10 +235,10 @@ Parameters:
     Type: String
     Description: >-
       Exact GitHub CLI 2.x version installed by the GitHub CLI 2.x document.
-      2.103.0 is the latest 2.x release (as of October 2026).
-    Default: "2.103.0"
+      2.103.2 is the latest 2.x release (as of October 2026).
+    Default: "2.103.2"
     AllowedPattern: ^2\.\d+\.\d+$
-    ConstraintDescription: Must be a 2.x.y version, e.g. 2.103.0.
+    ConstraintDescription: Must be a 2.x.y version, e.g. 2.103.2.
 
   AzCliV2Version:
     Type: String
