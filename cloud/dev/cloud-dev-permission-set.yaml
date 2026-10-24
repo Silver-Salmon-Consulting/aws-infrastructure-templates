@@ -186,7 +186,7 @@ Resources:
             Action:
               - ssm:TerminateSession
               - ssm:ResumeSession
-            Resource: !Sub "arn:aws:ssm:*:*:session/${!aws:userid}-*"
+            Resource: "arn:aws:ssm:*:*:session/${aws:userid}-*"
 
           - Sid: DescribeSessions
             Effect: Allow
