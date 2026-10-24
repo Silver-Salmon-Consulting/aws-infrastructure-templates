@@ -164,7 +164,7 @@ defaults (current as of October 2026), so every server gets the same release:
 - `DotNet8Version` (`8.0.426`), `DotNet10Version` (`10.0.402`)
 - `PlaywrightVersion` (`1.64.1`)
 - `K6V0Version` (`0.59.0`), `K6V1Version` (`1.8.2`), `AwsCliV2Version` (`2.38.5`),
-  `GhCliV2Version` (`2.103.0`), `AzCliV2Version` (`2.91.0`)
+  `GhCliV2Version` (`2.103.2`), `AzCliV2Version` (`2.91.0`)
 - `DefaultNpmVersion` (`12.2.1`) — exact npm, installed over Node's bundled one
 
 The stack echoes each one as an output named `<parameter>Output`
@@ -631,7 +631,7 @@ stops, so use the name only while the server is up.
 | `K6V0Version` | `0.59.0` | Exact k6 0.x release |
 | `K6V1Version` | `1.8.2` | Exact k6 1.x release |
 | `AwsCliV2Version` | `2.38.5` | Exact AWS CLI 2.x release |
-| `GhCliV2Version` | `2.103.0` | Exact GitHub CLI 2.x release |
+| `GhCliV2Version` | `2.103.2` | Exact GitHub CLI 2.x release |
 | `AzCliV2Version` | `2.91.0` | Exact Azure CLI 2.x release (with the `azure-devops` extension) |
 | `DefaultNpmVersion` | `12.2.1` | Exact npm version |
 | `HostedZoneId` | *(empty)* | Optional Route 53 zone; registers DNS for each server (see [DNS](#dns-for-dev-servers-optional)) |
