@@ -47,7 +47,7 @@ Metadata:
           - DotNetVersion
           - K6MajorVersion
           - AwsCliMajorVersion
-          - GhCliMajorVersion
+          - SourceProvider
     ParameterLabels:
       EnvironmentStackName:
         default: CloudDev environment stack name
@@ -87,8 +87,8 @@ Metadata:
         default: k6 major version
       AwsCliMajorVersion:
         default: AWS CLI (official installer) major version
-      GhCliMajorVersion:
-        default: GitHub CLI major version
+      SourceProvider:
+        default: Source control provider
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -308,15 +308,21 @@ Parameters:
       - v2
 
 
-  GhCliMajorVersion:
+  # The value IS the CloudDevSourceProvider tag value. It also selects the
+  # provider's CLI: CloudDevGhCliConfig / CloudDevAzCliConfig = v2.
+  SourceProvider:
     Type: String
     Description: >-
-      Install the GitHub CLI (/usr/local/bin/gh) at the environment stack's
-      pinned release in this major version, or "none" to skip it.
-    Default: none
+      Where this server's Git repos live. GitHub installs the GitHub CLI (gh);
+      AzureDevOps installs the Azure CLI (az) with its azure-devops extension.
+      Either way the server gets rotate-git-key and a code directory, and
+      rotate-git-key makes the right SSH key type (ed25519 for GitHub,
+      ssh-rsa for Azure DevOps). "none" sets up neither.
+    Default: GitHub
     AllowedValues:
+      - GitHub
+      - AzureDevOps
       - none
-      - v2
 
 # ---------------------------------------------------------------------------
 # Conditions
@@ -327,6 +333,8 @@ Conditions:
   AttachOllamaClientSg: !Not [!Equals [!Ref OllamaClientSecurityGroupId, ""]]
   IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
   PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
+  UsesGitHub: !Equals [!Ref SourceProvider, GitHub]
+  UsesAzureDevOps: !Equals [!Ref SourceProvider, AzureDevOps]
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -413,8 +421,14 @@ Resources:
           Value: !Ref K6MajorVersion
         - Key: CloudDevAwsCliConfig
           Value: !Ref AwsCliMajorVersion
+        # Source control: the provider picks the source control association
+        # (SSH key rotation, rotate-git-key, code directory) and its CLI.
+        - Key: CloudDevSourceProvider
+          Value: !Ref SourceProvider
         - Key: CloudDevGhCliConfig
-          Value: !Ref GhCliMajorVersion
+          Value: !If [UsesGitHub, v2, none]
+        - Key: CloudDevAzCliConfig
+          Value: !If [UsesAzureDevOps, v2, none]
       UserData:
         Fn::Base64:
           Fn::Sub:

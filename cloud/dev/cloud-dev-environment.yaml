@@ -43,6 +43,7 @@ Metadata:
           - K6V1Version
           - AwsCliV2Version
           - GhCliV2Version
+          - AzCliV2Version
     ParameterLabels:
       StackNamePrefix:
         default: Stack name prefix
@@ -72,6 +73,8 @@ Metadata:
         default: AWS CLI 2.x version
       GhCliV2Version:
         default: GitHub CLI 2.x version
+      AzCliV2Version:
+        default: Azure CLI 2.x version
       VpcMode:
         default: VPC topology
       AzCount:
@@ -236,6 +239,16 @@ Parameters:
     Default: "2.103.0"
     AllowedPattern: ^2\.\d+\.\d+$
     ConstraintDescription: Must be a 2.x.y version, e.g. 2.103.0.
+
+  AzCliV2Version:
+    Type: String
+    Description: >-
+      Exact Azure CLI 2.x version installed (with the azure-devops extension)
+      by the Azure CLI 2.x document on servers with SourceProvider=AzureDevOps.
+      2.91.0 is the latest 2.x release (as of October 2026).
+    Default: "2.91.0"
+    AllowedPattern: ^2\.\d+\.\d+$
+    ConstraintDescription: Must be a 2.x.y version, e.g. 2.91.0.
 
   VpcMode:
     Type: String
@@ -527,19 +540,19 @@ Resources:
               - Effect: Allow
                 Action: cloudformation:SignalResource
                 Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackNamePrefix}*/*"
-        # Lets a dev server run the GitHub document (key rotation) on dev
-        # servers of this environment, so rotate-github-key needs no extra
+        # Lets a dev server run the source control document (key rotation) on
+        # dev servers of this environment, so rotate-git-key needs no extra
         # AWS credentials. SendCommand is checked against the document and the
         # target instance separately. Scoped to the one document and to
         # instances tagged CloudDevEnvironment=<this stack>; it is not limited
         # to the calling instance, because every dev server shares this role.
-        - PolicyName: RotateGitHubSshKey
+        - PolicyName: RotateGitSshKey
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action: ssm:SendCommand
-                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${AmazonLinuxGhCliV2Document}"
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${AmazonLinuxSourceControlDocument}"
               - Effect: Allow
                 Action: ssm:SendCommand
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
@@ -1066,20 +1079,119 @@ Resources:
                 - chmod 700 /home/ec2-user/.aws
                 - chmod 600 /home/ec2-user/.aws/credentials
 
-  # GitHub document: installs the GitHub CLI 2.x AND rotates the GitHub SSH
-  # key, selected by the Action parameter (one script that branches on it).
-  #  - Install (default): GitHub CLI from GitHub's release tarball
-  #    (amd64/arm64 picked from uname) into /usr/local/bin/gh, pinned by
-  #    GhCliVersion. This is what the association runs at launch. git itself
-  #    comes from dnf with the Node config document.
-  #  - RotateSshKey: on-demand, run it from Run Command or the CLI; the
-  #    association never runs it. Generates a new ed25519 key for ec2-user
-  #    (the private key never leaves the instance), points the github.com
-  #    entry in ~/.ssh/config at it, keeps only the newest KeepKeys keys on
-  #    disk and prints the new public key plus the fingerprints of the keys it
-  #    removed. Adding the new key to GitHub and deleting the old ones there is
-  #    manual: the server holds no GitHub credentials.
+  # GitHub CLI 2.x from GitHub's release tarball (amd64/arm64 picked from
+  # uname) into /usr/local/bin/gh, pinned by GhCliVersion. Applied to servers
+  # with SourceProvider=GitHub. git itself comes from dnf with the Node config
+  # document; the SSH key, rotate-git-key and the code directory come from the
+  # source control document below.
   AmazonLinuxGhCliV2Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{GhCliVersion}} is an SSM document
+      # parameter and must reach the deployed document literally. (Its
+      # default is a plain !Ref, which leaves it alone.)
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install the GitHub CLI 2.x into /usr/local/bin/gh. Works on x86_64
+          and arm64 Amazon Linux.
+        parameters:
+          GhCliVersion:
+            type: String
+            description: >-
+              Exact GitHub CLI 2.x version to install (e.g. 2.103.0). Defaults
+              to the stack's GhCliV2Version, so a manual run needs no input.
+            default: !Ref GhCliV2Version
+            allowedPattern: ^2\.\d+\.\d+$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installGhCli
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - GH_VERSION="{{GhCliVersion}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  GH_ARCH="amd64" ;;
+                    aarch64) GH_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - dnf install -y tar gzip
+                - TMP_DIR=$(mktemp -d)
+                - curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$TMP_DIR"
+                - install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
+                - rm -rf "$TMP_DIR"
+                - /usr/local/bin/gh --version
+
+  # Azure CLI 2.x plus its azure-devops extension (az repos / az pipelines /
+  # az boards), the Azure DevOps counterpart of gh. Applied to servers with
+  # SourceProvider=AzureDevOps. Installs Microsoft's RHEL 9 RPM (x86_64 or
+  # aarch64) straight from packages.microsoft.com, pinned by AzCliVersion and
+  # signature-checked against Microsoft's key; dnf pulls its python3.12
+  # dependency from the AL2023 repos. No repo is added, so a dnf upgrade never
+  # moves it off the pin. The extension is installed for ec2-user, the user
+  # who signs in with `az devops login` (a PAT) or `az login`.
+  AmazonLinuxAzCliV2Document:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Authored WITHOUT Fn::Sub: {{AzCliVersion}} is an SSM document
+      # parameter and must reach the deployed document literally. (Its
+      # default is a plain !Ref, which leaves it alone.)
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Install the Azure CLI 2.x (/usr/bin/az) and the azure-devops
+          extension for ec2-user. Works on x86_64 and arm64 Amazon Linux.
+        parameters:
+          AzCliVersion:
+            type: String
+            description: >-
+              Exact Azure CLI 2.x version to install (e.g. 2.91.0). Defaults to
+              the stack's AzCliV2Version, so a manual run needs no input.
+            default: !Ref AzCliV2Version
+            allowedPattern: ^2\.\d+\.\d+$
+        mainSteps:
+          - action: aws:runShellScript
+            name: installAzCli
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                - AZ_VERSION="{{AzCliVersion}}"
+                - |
+                  case "$(uname -m)" in
+                    x86_64|aarch64) AZ_ARCH="$(uname -m)" ;;
+                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                - rpm --import https://packages.microsoft.com/keys/microsoft.asc
+                - AZ_RPM="https://packages.microsoft.com/rhel/9.0/prod/Packages/a/azure-cli-$AZ_VERSION-1.el9.$AZ_ARCH.rpm"
+                # install covers a first install and an upgrade; downgrade
+                # covers pinning an older release.
+                - dnf install -y --setopt=localpkg_gpgcheck=1 "$AZ_RPM" || dnf downgrade -y --setopt=localpkg_gpgcheck=1 "$AZ_RPM"
+                - sudo -u ec2-user -H az config set core.collect_telemetry=false --only-show-errors
+                - sudo -u ec2-user -H az extension add --name azure-devops --upgrade --yes --only-show-errors
+                - sudo -u ec2-user -H az version
+
+  # Source control document: provider-neutral Git setup for dev servers,
+  # selected by the Action parameter (one script that branches on it).
+  # Provider is the server's SourceProvider (its CloudDevSourceProvider tag)
+  # unless set explicitly.
+  #  - Setup (default): installs the rotate-git-key helper into
+  #    /usr/local/bin (rotate-github-key is kept as a link to it) and creates
+  #    the code directory for ec2-user. This is what the association runs.
+  #  - RotateSshKey: on-demand, run it from Run Command, the CLI or
+  #    rotate-git-key; the association never runs it. Generates a new key for
+  #    ec2-user in ~/.ssh/<provider>/ (the private key never leaves the
+  #    instance): ed25519 for GitHub, 4096-bit ssh-rsa for Azure DevOps, which
+  #    accepts only RSA. Points that provider's managed ~/.ssh/config block at
+  #    it, keeps only the newest KeepKeys keys for that provider and prints the
+  #    new public key plus the fingerprints of the keys it removed. Adding the
+  #    new key in GitHub / Azure DevOps and deleting the old ones there is
+  #    manual: the server holds no credentials for either.
+  AmazonLinuxSourceControlDocument:
     Type: AWS::SSM::Document
     Properties:
       DocumentType: Command
@@ -1089,44 +1201,50 @@ Resources:
       Content:
         schemaVersion: "2.2"
         description: >-
-          GitHub on Amazon Linux dev servers. Action=Install installs the
-          GitHub CLI 2.x into /usr/local/bin/gh plus the rotate-github-key
-          helper into /usr/local/bin and creates the CodeDirectory for ec2-user; Action=RotateSshKey generates
-          a new GitHub SSH key for ec2-user and prints the public key to add
-          in GitHub.
+          Git source control on Amazon Linux dev servers (GitHub or Azure
+          DevOps). Action=Setup installs the rotate-git-key helper and creates
+          the code directory for ec2-user; Action=RotateSshKey generates a new
+          SSH key for ec2-user (ed25519 for GitHub, ssh-rsa for Azure DevOps)
+          and prints the public key to add.
         parameters:
           Action:
             type: String
-            description: Install the GitHub CLI, or rotate the GitHub SSH key.
-            default: Install
+            description: Set up the server, or rotate the SSH key.
+            default: Setup
             allowedValues:
-              - Install
+              - Setup
               - RotateSshKey
-          GhCliVersion:
+          Provider:
             type: String
             description: >-
-              Exact GitHub CLI 2.x version to install (e.g. 2.103.0). Required
-              for Action=Install, ignored for RotateSshKey.
-            default: ""
-            allowedPattern: ^(2\.\d+\.\d+)?$
-          CodeDirectory:
-            type: String
-            description: >-
-              Install only: directory created for ec2-user to clone code into.
-              Existing contents are never touched.
-            default: /home/ec2-user/github
-            allowedPattern: ^/home/ec2-user/[A-Za-z0-9._/-]+$
+              auto (default) uses the server's SourceProvider tag. Set GitHub
+              or AzureDevOps to rotate that provider's key instead, e.g. on a
+              server that uses both.
+            default: auto
+            allowedValues:
+              - auto
+              - GitHub
+              - AzureDevOps
           KeepKeys:
             type: String
             description: >-
-              RotateSshKey only: how many keys to keep on the instance,
-              including the new one (2 = the new key plus the previous one,
-              for rollback).
+              RotateSshKey only: how many of this provider's keys to keep on
+              the instance, including the new one (2 = the new key plus the
+              previous one, for rollback).
             default: "2"
             allowedPattern: ^[1-9]$
+          CodeDirectory:
+            type: String
+            description: >-
+              Setup only: directory created for ec2-user to clone code into.
+              Empty (default) = /home/ec2-user/github for GitHub,
+              /home/ec2-user/azuredevops for Azure DevOps. Existing contents
+              are never touched.
+            default: ""
+            allowedPattern: ^(/home/ec2-user/[A-Za-z0-9._/-]+)?$
         mainSteps:
           - action: aws:runShellScript
-            name: githubSetup
+            name: sourceControl
             inputs:
               # One script that branches on Action. (Document-level
               # preconditions were not used: they cannot reliably gate steps
@@ -1136,97 +1254,114 @@ Resources:
                   set -euo pipefail
                   ACTION="{{Action}}"
                   case "$ACTION" in
-                    Install|RotateSshKey) ;;
+                    Setup|RotateSshKey) ;;
                     *) echo "Unknown Action: $ACTION" >&2; exit 1 ;;
+                  esac
+
+                  # The server's tags: the provider (auto) and the key title.
+                  TOKEN=$(curl -sS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds:60" http://169.254.169.254/latest/api/token)
+                  INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                  REGION=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+                  TAGS=$(aws ec2 describe-tags --region "$REGION" --filters "Name=resource-id,Values=$INSTANCE_ID" --query 'Tags[].[Key,Value]' --output text 2>/dev/null || true)
+                  tag() { printf '%s\n' "$TAGS" | awk -F'\t' -v k="$1" '$1==k{print $2}'; }
+
+                  PROVIDER="{{Provider}}"
+                  if [ "$PROVIDER" = "auto" ]; then
+                    PROVIDER=$(tag CloudDevSourceProvider)
+                    case "$PROVIDER" in
+                      GitHub|AzureDevOps) ;;
+                      *) echo "This server's CloudDevSourceProvider tag is '${PROVIDER:-unset}'; set SourceProvider on its stack or pass Provider=GitHub|AzureDevOps." >&2; exit 1 ;;
+                    esac
+                  fi
+                  case "$PROVIDER" in
+                    GitHub)
+                      SLUG=github KEY_TYPE=ed25519 KEYGEN_ARGS=(-t ed25519)
+                      SSH_HOSTS="github.com" CHECK="ssh -T git@github.com"
+                      ADD_AT="GitHub > Settings > SSH and GPG keys > New SSH key (or as a deploy key on one repo)"
+                      ;;
+                    AzureDevOps)
+                      # vs-ssh.visualstudio.com serves older *.visualstudio.com org URLs.
+                      SLUG=azuredevops KEY_TYPE=rsa KEYGEN_ARGS=(-t rsa -b 4096)
+                      SSH_HOSTS="ssh.dev.azure.com vs-ssh.visualstudio.com" CHECK="ssh -T git@ssh.dev.azure.com"
+                      ADD_AT="Azure DevOps > User settings > SSH public keys > New Key"
+                      ;;
                   esac
 
                   if [ "$ACTION" = "RotateSshKey" ]; then
                     KEEP="{{KeepKeys}}"
                     USER_NAME=ec2-user
                     SSH_DIR="/home/$USER_NAME/.ssh"
-                    KEY_DIR="$SSH_DIR/github"
+                    KEY_DIR="$SSH_DIR/$SLUG"
                     mkdir -p "$KEY_DIR"
                     chmod 700 "$SSH_DIR" "$KEY_DIR"
-                    TOKEN=$(curl -sS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds:60" http://169.254.169.254/latest/api/token)
-                    INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
                     STAMP=$(date -u +%Y%m%dT%H%M%SZ)
                     # Name the key after the server, not the instance ID: the DnsName tag if
                     # set, else the CloudFormation stack name, else the instance ID.
-                    REGION=$(curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
-                    TAGS=$(aws ec2 describe-tags --region "$REGION" --filters "Name=resource-id,Values=$INSTANCE_ID" --query 'Tags[].[Key,Value]' --output text 2>/dev/null || true)
-                    NAME=$(printf '%s\n' "$TAGS" | awk -F'\t' '$1=="DnsName"{print $2}')
-                    [ -n "$NAME" ] || NAME=$(printf '%s\n' "$TAGS" | awk -F'\t' '$1=="aws:cloudformation:stack-name"{print $2}')
+                    NAME=$(tag DnsName)
+                    [ -n "$NAME" ] || NAME=$(tag aws:cloudformation:stack-name)
                     [ -n "$NAME" ] || NAME="$INSTANCE_ID"
                     NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-')
                     TITLE="$NAME-$STAMP"
-                    NEW_KEY="$KEY_DIR/id_ed25519_$STAMP"
-                    ssh-keygen -q -t ed25519 -N "" -C "$TITLE" -f "$NEW_KEY"
+                    NEW_KEY="$KEY_DIR/id_${KEY_TYPE}_$STAMP"
+                    ssh-keygen -q "${KEYGEN_ARGS[@]}" -N "" -C "$TITLE" -f "$NEW_KEY"
+                    # This provider's managed block goes at the top of ~/.ssh/config (ssh
+                    # uses the first value it finds); the rest of the file is kept.
                     touch "$SSH_DIR/config"
-                    sed -i '/^# BEGIN clouddev-github$/,/^# END clouddev-github$/d' "$SSH_DIR/config"
+                    sed -i "/^# BEGIN clouddev-$SLUG\$/,/^# END clouddev-$SLUG\$/d" "$SSH_DIR/config"
                     CONFIG_TMP=$(mktemp)
-                    printf '# BEGIN clouddev-github\nHost github.com\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-github\n' "$NEW_KEY" > "$CONFIG_TMP"
+                    printf '# BEGIN clouddev-%s\nHost %s\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n# END clouddev-%s\n' "$SLUG" "$SSH_HOSTS" "$NEW_KEY" "$SLUG" > "$CONFIG_TMP"
                     cat "$SSH_DIR/config" >> "$CONFIG_TMP"
                     cat "$CONFIG_TMP" > "$SSH_DIR/config"
                     rm -f "$CONFIG_TMP"
                     chmod 600 "$SSH_DIR/config"
                     REMOVED=""
-                    for OLD in $(ls -1 "$KEY_DIR"/id_ed25519_* 2>/dev/null | grep -v '\.pub$' | sort -r | tail -n +$((KEEP + 1))); do
+                    # Keep the newest keys: sort on the timestamp after the last "_"
+                    # (id_<type>_<stamp>), not on the whole name.
+                    for OLD in $(ls -1 "$KEY_DIR"/id_* 2>/dev/null | grep -v '\.pub$' | awk -F_ '{print $NF "\t" $0}' | sort -r | cut -f2 | tail -n +$((KEEP + 1))); do
                       REMOVED="$REMOVED$(ssh-keygen -lf "$OLD.pub")"$'\n'
                       rm -f "$OLD" "$OLD.pub"
                     done
                     chown -R "$USER_NAME:$USER_NAME" "$SSH_DIR"
-                    echo "=== New GitHub SSH key ==="
+                    echo "=== New $PROVIDER SSH key ($KEY_TYPE) ==="
                     echo "Title: $TITLE"
                     ssh-keygen -lf "$NEW_KEY.pub"
-                    echo "Public key (add in GitHub > Settings > SSH keys, or as a deploy key):"
+                    echo "Public key (add in $ADD_AT):"
                     cat "$NEW_KEY.pub"
-                    echo "=== Removed from this instance (delete the matching keys in GitHub) ==="
+                    echo "=== Removed from this instance (delete the matching keys in $PROVIDER) ==="
                     if [ -n "$REMOVED" ]; then printf "%s" "$REMOVED"; else echo "(none)"; fi
-                    echo "After adding the key, verify with: sudo -u ec2-user ssh -T git@github.com"
+                    echo "After adding the key, verify with: sudo -u ec2-user $CHECK"
                     exit 0
                   fi
 
-                  # Action=Install: the GitHub CLI, then the rotate-github-key helper.
-                  GH_VERSION="{{GhCliVersion}}"
-                  [ -n "$GH_VERSION" ] || { echo "GhCliVersion is required for Action=Install" >&2; exit 1; }
-                  case "$(uname -m)" in
-                    x86_64)  GH_ARCH="amd64" ;;
-                    aarch64) GH_ARCH="arm64" ;;
-                    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-                  esac
-                  dnf install -y tar gzip
-                  TMP_DIR=$(mktemp -d)
-                  curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$TMP_DIR"
-                  install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
-                  rm -rf "$TMP_DIR"
-                  /usr/local/bin/gh --version
-
-                  # Install the helper on the server so `rotate-github-key` works from first
-                  # boot. This is a copy of cloud/dev/scripts/rotate-github-ssh-key.sh: keep the
-                  # two in sync (the repo file is the source of truth; CI checks they match).
-                  cat > /usr/local/bin/rotate-github-key <<'ROTATE_EOF'
+                  # Action=Setup: the rotate-git-key helper, then the code directory.
+                  # This is a copy of cloud/dev/scripts/rotate-git-ssh-key.sh: keep the two
+                  # in sync (the repo file is the source of truth; CI checks they match).
+                  cat > /usr/local/bin/rotate-git-key <<'ROTATE_EOF'
                   #!/bin/bash
-                  # Rotate the GitHub SSH key on a CloudDev dev server by running the
-                  # environment stack's GitHub SSM document with Action=RotateSshKey, then print
-                  # the new public key to add in GitHub.
+                  # Rotate the Git SSH key on a CloudDev dev server by running the environment
+                  # stack's source control SSM document with Action=RotateSshKey, then print the
+                  # new public key to add in GitHub or Azure DevOps.
                   #
-                  # Usage: rotate-github-ssh-key.sh [-i instance-id] [-k keep] [-r region]
-                  #                                 [-p aws-profile] [-d document-name]
+                  # Usage: rotate-git-key [-P github|azuredevops] [-i instance-id] [-k keep]
+                  #                       [-r region] [-p aws-profile] [-d document-name]
                   #
-                  # Defaults: the instance this script runs on (from instance metadata), keep 2
-                  # keys, the region from instance metadata or AWS_REGION, and the document found
-                  # by name. Run it anywhere your AWS credentials allow ssm:SendCommand on the
-                  # document and the instance: the CloudDev permission set does, and so does the
-                  # shared dev server role (for servers of its own environment), so on a server
-                  # no profile is needed. -p selects another profile.
+                  # Defaults: the server's own source provider (its SourceProvider choice; GitHub
+                  # gets an ed25519 key, Azure DevOps a 4096-bit ssh-rsa key), the instance this
+                  # script runs on (from instance metadata), keep 2 keys, the region from instance
+                  # metadata or AWS_REGION, and the document found by name. -P rotates the other
+                  # provider's key instead, for a server that uses both. Run it anywhere your AWS
+                  # credentials allow ssm:SendCommand on the document and the instance: the
+                  # CloudDev permission set does, and so does the shared dev server role (for
+                  # servers of its own environment), so on a server no profile is needed.
                   set -euo pipefail
 
-                  INSTANCE="" KEEP=2 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" DOC="${DOC:-}" PROFILE_ARGS=()
+                  INSTANCE="" KEEP=2 PROVIDER=auto REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" DOC="${DOC:-}" PROFILE_ARGS=()
 
-                  usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+                  usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-                  while getopts "i:k:r:p:d:h" opt; do
+                  while getopts "P:i:k:r:p:d:h" opt; do
                     case "$opt" in
+                      P) PROVIDER="$OPTARG" ;;
                       i) INSTANCE="$OPTARG" ;;
                       k) KEEP="$OPTARG" ;;
                       r) REGION="$OPTARG" ;;
@@ -1236,6 +1371,13 @@ Resources:
                       *) usage 1 ;;
                     esac
                   done
+
+                  case "$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')" in
+                    auto) PROVIDER=auto ;;
+                    github) PROVIDER=GitHub ;;
+                    azuredevops|azure|ado) PROVIDER=AzureDevOps ;;
+                    *) echo "Unknown provider: $PROVIDER (use github or azuredevops)." >&2; exit 1 ;;
+                  esac
 
                   imds() {
                     local token
@@ -1257,17 +1399,17 @@ Resources:
                     # list-documents is paginated and --query runs per page, so pages with no
                     # match print "None"; keep only the first real name.
                     DOC=$(aws_ ssm list-documents --filters Key=Owner,Values=Self \
-                      --query "DocumentIdentifiers[?contains(Name,'AmazonLinuxGhCliV2Document')].Name" --output text \
+                      --query "DocumentIdentifiers[?contains(Name,'AmazonLinuxSourceControlDocument')].Name" --output text \
                       | tr '\t' '\n' | grep -v -E '^(None)?$' | head -n 1 || true)
                     if [ -z "$DOC" ]; then
-                      echo "Could not find the GitHub SSM document; pass -d <document-name>." >&2
+                      echo "Could not find the source control SSM document; pass -d <document-name>." >&2
                       exit 1
                     fi
                   fi
 
-                  echo "Rotating the GitHub SSH key on $INSTANCE ($REGION) with $DOC (keep $KEEP)..."
+                  echo "Rotating the $PROVIDER SSH key on $INSTANCE ($REGION) with $DOC (keep $KEEP)..."
                   CMD=$(aws_ ssm send-command --document-name "$DOC" --instance-ids "$INSTANCE" \
-                    --parameters "Action=RotateSshKey,KeepKeys=$KEEP" \
+                    --parameters "Action=RotateSshKey,Provider=$PROVIDER,KeepKeys=$KEEP" \
                     --query Command.CommandId --output text)
 
                   # 'wait' exits non-zero if the command fails; still show the output then.
@@ -1285,17 +1427,19 @@ Resources:
 
                   cat <<'EOF'
 
-                  Next: add the public key above in GitHub (Settings > SSH keys > New SSH key, or
-                  as a deploy key on one repo), delete the keys listed under "Removed", then check:
-                    ssh -T git@github.com
+                  Next: add the public key above where the output says, delete the keys listed
+                  under "Removed", then run the check command it printed.
                   EOF
                   ROTATE_EOF
-                  chmod 0755 /usr/local/bin/rotate-github-key
-                  /usr/local/bin/rotate-github-key -h > /dev/null
+                  chmod 0755 /usr/local/bin/rotate-git-key
+                  # The old name, used before Azure DevOps support.
+                  ln -sfn rotate-git-key /usr/local/bin/rotate-github-key
+                  /usr/local/bin/rotate-git-key -h > /dev/null
 
                   # A directory ready for code, owned by ec2-user. Safe to re-run:
                   # mkdir -p and chown on the directory itself only.
                   CODE_DIR="{{CodeDirectory}}"
+                  [ -n "$CODE_DIR" ] || CODE_DIR="/home/ec2-user/$SLUG"
                   mkdir -p "$CODE_DIR"
                   chown ec2-user:ec2-user "$CODE_DIR"
                   chmod 0755 "$CODE_DIR"
@@ -1535,14 +1679,41 @@ Resources:
       AssociationName: !Sub "${AWS::StackName}-ghcli-v2"
       Name: !Ref AmazonLinuxGhCliV2Document
       Parameters:
-        Action:
-          - Install
         GhCliVersion:
           - !Ref GhCliV2Version
       Targets:
         - Key: "tag:CloudDevGhCliConfig"
           Values:
             - v2
+
+  AzCliV2ConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-azcli-v2"
+      Name: !Ref AmazonLinuxAzCliV2Document
+      Parameters:
+        AzCliVersion:
+          - !Ref AzCliV2Version
+      Targets:
+        - Key: "tag:CloudDevAzCliConfig"
+          Values:
+            - v2
+
+  # rotate-git-key and the code directory on every server with a source
+  # provider. The SSH key itself is rotated on demand, never by this.
+  SourceControlConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-source-control"
+      Name: !Ref AmazonLinuxSourceControlDocument
+      Parameters:
+        Action:
+          - Setup
+      Targets:
+        - Key: "tag:CloudDevSourceProvider"
+          Values:
+            - GitHub
+            - AzureDevOps
 
   # ---- VPC + public networking (created when VpcMode != none) ----
   Vpc:
@@ -1923,11 +2094,79 @@ Outputs:
   AmazonLinuxGhCliV2DocumentName:
     Description: >-
       Name of the shared SSM Command Document that installs the GitHub CLI 2.x
-      (Action=Install, GhCliVersion parameter) and rotates the GitHub SSH key
-      (Action=RotateSshKey, run on demand) on Amazon Linux dev servers.
+      (GhCliVersion parameter) on Amazon Linux dev servers.
     Value: !Ref AmazonLinuxGhCliV2Document
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxGhCliV2DocumentName"
+
+  AmazonLinuxAzCliV2DocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that installs the Azure CLI 2.x
+      and its azure-devops extension (AzCliVersion parameter) on Amazon Linux
+      dev servers.
+    Value: !Ref AmazonLinuxAzCliV2Document
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxAzCliV2DocumentName"
+
+  AmazonLinuxSourceControlDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that sets up Git source control
+      (Action=Setup) and rotates the GitHub / Azure DevOps SSH key
+      (Action=RotateSshKey, run on demand) on Amazon Linux dev servers.
+    Value: !Ref AmazonLinuxSourceControlDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxSourceControlDocumentName"
+
+  # Fleet-wide software versions: the pinned parameters above, echoed so the
+  # stack's Outputs tab shows what the associations install. (Output names
+  # cannot repeat parameter names, hence the Output suffix.)
+  DefaultNodeVersionOutput:
+    Description: Node.js major version installed on every dev server.
+    Value: !Ref DefaultNodeVersion
+
+  DefaultNpmVersionOutput:
+    Description: Exact npm version installed over Node's bundled npm.
+    Value: !Ref DefaultNpmVersion
+
+  PowerShell74VersionOutput:
+    Description: Exact PowerShell 7.4.x release (servers with PowerShellVersion=v7.4).
+    Value: !Ref PowerShell74Version
+
+  PowerShell76VersionOutput:
+    Description: Exact PowerShell 7.6.x release (servers with PowerShellVersion=v7.6).
+    Value: !Ref PowerShell76Version
+
+  DotNet8VersionOutput:
+    Description: .NET 8 SDK version (servers with DotNetVersion=v8).
+    Value: !Ref DotNet8Version
+
+  DotNet10VersionOutput:
+    Description: .NET 10 SDK version (servers with DotNetVersion=v10).
+    Value: !Ref DotNet10Version
+
+  PlaywrightVersionOutput:
+    Description: Playwright version whose Chromium is installed (servers with EnablePlaywright=true).
+    Value: !Ref PlaywrightVersion
+
+  K6V0VersionOutput:
+    Description: Exact k6 0.x release (servers with K6MajorVersion=v0).
+    Value: !Ref K6V0Version
+
+  K6V1VersionOutput:
+    Description: Exact k6 1.x release (servers with K6MajorVersion=v1).
+    Value: !Ref K6V1Version
+
+  AwsCliV2VersionOutput:
+    Description: Exact AWS CLI 2.x release (servers with AwsCliMajorVersion=v2).
+    Value: !Ref AwsCliV2Version
+
+  GhCliV2VersionOutput:
+    Description: Exact GitHub CLI 2.x release (servers with SourceProvider=GitHub).
+    Value: !Ref GhCliV2Version
+
+  AzCliV2VersionOutput:
+    Description: Exact Azure CLI 2.x release (servers with SourceProvider=AzureDevOps).
+    Value: !Ref AzCliV2Version
 
   VpcId:
     Condition: CreateVpc

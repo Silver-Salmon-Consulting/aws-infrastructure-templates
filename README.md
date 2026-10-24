@@ -71,6 +71,9 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
      `tag:CloudDevK6Config = v0` / `v1`
    - `AwsCliV2ConfigAssociation` targets `tag:CloudDevAwsCliConfig = v2`
    - `GhCliV2ConfigAssociation` targets `tag:CloudDevGhCliConfig = v2`
+   - `AzCliV2ConfigAssociation` targets `tag:CloudDevAzCliConfig = v2`
+   - `SourceControlConfigAssociation` targets `tag:CloudDevSourceProvider = GitHub`
+     or `AzureDevOps` (see [Source control](#source-control-github-or-azure-devops))
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
    - `CloudDevPowerShellConfig = <PowerShellVersion>` (`none` / `v7.4` / `v7.6`,
@@ -82,7 +85,9 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `CloudDevBaseToolsConfig = enabled` (always — jq, zip and unzip)
    - `CloudDevK6Config = <K6MajorVersion>` (`none` / `v0` / `v1`, default `none`)
    - `CloudDevAwsCliConfig = <AwsCliMajorVersion>` (`none` / `v2`, default `none`)
-   - `CloudDevGhCliConfig = <GhCliMajorVersion>` (`none` / `v2`, default `none`)
+   - `CloudDevSourceProvider = <SourceProvider>` (`GitHub` / `AzureDevOps` /
+     `none`, default `GitHub`), plus `CloudDevGhCliConfig = v2` for GitHub or
+     `CloudDevAzCliConfig = v2` for Azure DevOps (`none` otherwise)
 
 The .NET SDK installs into `/opt/dotnet` (via Microsoft's `dotnet-install.sh`,
 x64 or arm64 automatically), with `/usr/bin/dotnet` symlinked and `DOTNET_ROOT`
@@ -100,14 +105,14 @@ Playwright's WebKit and Firefox builds target Ubuntu.
 
 ### Versioned tool documents
 
-Tools whose version matters to a project (PowerShell, .NET, k6, the AWS CLI, the GitHub CLI)
+Tools whose version matters to a project (PowerShell, .NET, k6, the AWS CLI, the GitHub CLI, the Azure CLI)
 follow one pattern: **one SSM document per tool per major version** (PowerShell:
 per release line), for example `AmazonLinuxK6V0Document` and
 `AmazonLinuxK6V1Document`. Nothing floats to `latest`: every document takes an
 **exact version** with no default of its own, and the association passes it in
 from a pinned environment-stack parameter (`PowerShell74Version`,
 `PowerShell76Version`, `DotNet8Version`, `DotNet10Version`, `K6V0Version`,
-`K6V1Version`, `AwsCliV2Version`, `GhCliV2Version`).
+`K6V1Version`, `AwsCliV2Version`, `GhCliV2Version`, `AzCliV2Version`).
 
 - The document fixes the major version. Its version parameter (`PowerShellVersion`,
   `DotNetVersion`, `K6Version`, `AwsCliVersion`) takes an exact version
@@ -115,7 +120,8 @@ from a pinned environment-stack parameter (`PowerShell74Version`,
 - Each major has its own association. All majors of a tool share one tag key
   and differ by tag **value**, so a server selects exactly one major
   (`CloudDevK6Config = v0`), and `none` selects nothing. Server stacks expose
-  this as `K6MajorVersion` / `AwsCliMajorVersion` / `GhCliMajorVersion`.
+  this as `K6MajorVersion` / `AwsCliMajorVersion`. The GitHub and Azure CLIs
+  are chosen by `SourceProvider` instead.
 - To add a major, copy the document and association, change the major number,
   and add the value to the server stacks' `AllowedValues`.
 - To roll the fleet to a new release, change the pinned parameter on the
@@ -156,110 +162,210 @@ defaults (current as of October 2026), so every server gets the same release:
 - `DotNet8Version` (`8.0.426`), `DotNet10Version` (`10.0.402`)
 - `PlaywrightVersion` (`1.64.1`)
 - `K6V0Version` (`0.59.0`), `K6V1Version` (`1.8.2`), `AwsCliV2Version` (`2.38.5`),
-  `GhCliV2Version` (`2.103.0`)
+  `GhCliV2Version` (`2.103.0`), `AzCliV2Version` (`2.91.0`)
 - `DefaultNpmVersion` (`12.2.1`) — exact npm, installed over Node's bundled one
 
+The stack echoes each one as an output named `<parameter>Output`
+(`DotNet8VersionOutput`, `GhCliV2VersionOutput`, ...), so the stack's **Outputs**
+tab shows what is deployed, and you can copy a value from there when running a
+document by hand. From the CLI:
+
+```bash
+aws cloudformation describe-stacks --stack-name <environment-stack> \
+  --query "Stacks[0].Outputs[?ends_with(OutputKey,'VersionOutput')].[OutputKey,OutputValue]" --output table
+```
+
 Servers only choose *which* line to install (`PowerShellVersion`,
-`DotNetVersion`, `K6MajorVersion`, `AwsCliMajorVersion`, `GhCliMajorVersion` dropdowns); the exact
+`DotNetVersion`, `K6MajorVersion`, `AwsCliMajorVersion`, `SourceProvider` dropdowns); the exact
 release is fleet-wide.
 
 Server stacks do not take an exact version. Changing the fleet version means
 updating the environment stack and re-applying the association on existing
 servers (new servers pick it up automatically).
 
-### GitHub SSH key rotation
+### Source control: GitHub or Azure DevOps
 
-The GitHub document (`AmazonLinuxGhCliV2Document`) does two jobs, selected by its
-`Action` parameter. `Install` (the default, run by the association at launch)
-installs the GitHub CLI. `RotateSshKey` is **on demand only**; nothing runs it
-automatically. It:
+Each server stack picks where its Git repos live with **`SourceProvider`**
+(`GitHub`, the default, / `AzureDevOps` / `none`). The choice becomes the
+instance's `CloudDevSourceProvider` tag and decides what the server gets:
 
-1. generates a new ed25519 key for `ec2-user` in `~/.ssh/github/` (the private
-   key never leaves the instance);
-2. points the `github.com` entry in `~/.ssh/config` at the new key (a managed
-   block between `# BEGIN/END clouddev-github` markers, placed at the **top** of
-   the file because ssh uses the first value it finds; the rest of the file is
-   kept). A hand-written `Host github.com` block further down still lists its own
-   key as a fallback, so remove it once you no longer want the old key used;
-3. keeps only the newest `KeepKeys` keys on the instance (default `2`: the new
-   key plus the previous one for rollback) and deletes the rest;
-4. prints the new public key, its fingerprint, a suggested GitHub title
-   (`<server name>-<timestamp>`, where the server name is the instance's
+| | `GitHub` | `AzureDevOps` |
+| --- | --- | --- |
+| CLI | GitHub CLI `gh` (`GhCliV2Version`) | Azure CLI `az` (`AzCliV2Version`) + `azure-devops` extension |
+| SSH key `rotate-git-key` makes | ed25519 | 4096-bit `ssh-rsa` (Azure DevOps accepts only RSA) |
+| Hosts in the managed `~/.ssh/config` block | `github.com` | `ssh.dev.azure.com`, `vs-ssh.visualstudio.com` |
+| Keys on the server | `~/.ssh/github/` | `~/.ssh/azuredevops/` |
+| Code directory | `/home/ec2-user/github` | `/home/ec2-user/azuredevops` |
+
+Both get `rotate-git-key` in `/usr/local/bin` (`rotate-github-key` still works as
+a link to it). git itself comes with the Node document. `none` sets up neither.
+
+Three documents do this:
+
+- **`AmazonLinuxSourceControlDocument`** (provider-neutral). `Action=Setup` (run
+  by its association on every server with a provider) installs `rotate-git-key`
+  and creates the code directory (override with `CodeDirectory`; existing
+  contents are never touched). `Action=RotateSshKey` is **on demand only**;
+  nothing runs it automatically.
+- **`AmazonLinuxGhCliV2Document`** installs `gh` (`CloudDevGhCliConfig = v2`).
+- **`AmazonLinuxAzCliV2Document`** installs `az` from Microsoft's RHEL 9 RPM
+  (x86_64 or arm64, pinned, signature-checked; no repo is added) and the
+  `azure-devops` extension for `ec2-user`, with telemetry off
+  (`CloudDevAzCliConfig = v2`).
+
+Changing `SourceProvider` on an existing server switches which CLI the
+associations target; the other CLI stays installed until you remove it.
+
+#### Signing in to the CLI (optional)
+
+SSH is enough for `git clone`/`pull`/`push`. The CLI is for pull requests,
+pipelines and so on, and needs its own sign-in as `ec2-user`:
+
+```bash
+# GitHub
+gh auth login                     # or: export GH_TOKEN=<token>
+
+# Azure DevOps: a PAT with the scopes you need (e.g. Code, Build)
+az devops login --organization https://dev.azure.com/<org>   # paste the PAT
+az devops configure --defaults organization=https://dev.azure.com/<org> project=<project>
+az repos list -o table
+```
+
+#### Rotating the SSH key
+
+`RotateSshKey`:
+
+1. generates a new key for `ec2-user` in `~/.ssh/<provider>/`: **ed25519 for
+   GitHub, 4096-bit ssh-rsa for Azure DevOps**. The private key never leaves the
+   instance;
+2. points that provider's managed block in `~/.ssh/config` at the new key
+   (between `# BEGIN/END clouddev-github` or `clouddev-azuredevops` markers,
+   placed at the **top** of the file because ssh uses the first value it finds;
+   the rest of the file is kept). A hand-written block for the same host further
+   down still lists its own key as a fallback, so remove it once you no longer
+   want the old key used;
+3. keeps only the newest `KeepKeys` keys **for that provider** (default `2`: the
+   new key plus the previous one for rollback) and deletes the rest. The other
+   provider's keys are never touched;
+4. prints the new public key, its fingerprint, where to add it, a suggested
+   title (`<server name>-<timestamp>`, where the server name is the instance's
    `DnsName` tag if set, else its CloudFormation stack name, else the instance
-   ID) and the fingerprints of the keys it removed.
+   ID), the fingerprints of the keys it removed and the command to check it.
 
-The same document's `Install` action also creates a code directory for `ec2-user`
-(`/home/ec2-user/github` by default, set with the `CodeDirectory` document
-parameter), ready to `git clone` into. It is created once, existing contents are
-never touched, and re-running it is safe.
+The provider is the server's own `SourceProvider` unless you pass one. Passing
+the other one gives a server keys for **both** (e.g. a GitHub server that also
+pulls from Azure DevOps); each provider keeps its own key, block and `KeepKeys`.
 
-It cannot touch GitHub: the server holds no GitHub credentials. Adding the new
-public key and deleting the old ones in GitHub is a manual step. GitHub SSH keys
-never expire on their own, so rotation is what keeps them short-lived. Prefer
-**deploy keys** (one repo, read-only by default) or a dedicated **machine user**
-over a personal account's key.
+It cannot touch GitHub or Azure DevOps: the server holds no credentials for
+either. Adding the new public key and deleting the old ones is a manual step.
+SSH keys there never expire on their own, so rotation is what keeps them
+short-lived. On GitHub prefer **deploy keys** (one repo, read-only by default) or
+a dedicated **machine user** over a personal account's key.
 
-**Run it from anywhere** you have AWS credentials and `ssm:SendCommand` — your
-laptop, CloudShell, or the console. The instance only needs to be running and
-SSM-managed.
+**With `rotate-git-key`** (the simplest way). By default it rotates the key of
+the server it runs on, for that server's provider, keeping 2 keys:
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `-P github\|azuredevops` | provider whose key to rotate | the server's `SourceProvider` |
+| `-k N` | that provider's keys to keep on the instance, 1-9, including the new one | `2` |
+| `-i <instance-id>` | server to rotate | the server it runs on |
+| `-r <region>` | AWS region | instance metadata, else `AWS_REGION` |
+| `-p <profile>` | AWS CLI profile | none (server role / your default login) |
+| `-d <document>` | source control SSM document name | found by name |
+| `-h` | print usage | |
+
+```bash
+# On a dev server (rotates that server, using the server role)
+rotate-git-key                       # its own provider: ed25519 (GitHub) or ssh-rsa (Azure DevOps), keep 2
+rotate-git-key -k 1                  # its own provider, keep only the new key
+rotate-git-key -P github             # GitHub key (ed25519), whatever the server's provider
+rotate-git-key -P azuredevops        # Azure DevOps key (ssh-rsa), whatever the server's provider
+rotate-git-key -P azuredevops -k 3   # Azure DevOps key, keep the new one + 2 previous
+
+# From a laptop or CloudShell (name the server; add -r if it is not your default region)
+install -m 0755 cloud/dev/scripts/rotate-git-ssh-key.sh ~/.local/bin/rotate-git-key
+rotate-git-key -i i-0123456789abcdef0
+rotate-git-key -i i-0123456789abcdef0 -P azuredevops
+rotate-git-key -i i-0123456789abcdef0 -P github -k 3 -r us-west-2 -p clouddev
+rotate-git-key -i i-0123456789abcdef0 -d <stack>-AmazonLinuxSourceControlDocument-XXXX  # if the lookup fails
+```
+
+On a dev server it needs no AWS profile: the shared server role may send this one
+document to dev servers of the same environment (it is not limited to the calling
+instance, because all of them share the role). From your laptop it uses your normal
+AWS login, and `-p <profile>` selects a different one anywhere. The script is
+[cloud/dev/scripts/rotate-git-ssh-key.sh](cloud/dev/scripts/rotate-git-ssh-key.sh);
+the source control document embeds a copy and CI checks the two match, so edit
+both together.
+
+**With the AWS CLI directly**, from anywhere you have AWS credentials and
+`ssm:SendCommand`. The instance only needs to be running and SSM-managed.
 
 ```bash
 # Look up the document name and the instance (once)
 DOC=$(aws cloudformation describe-stacks --stack-name <environment-stack> \
-  --query "Stacks[0].Outputs[?OutputKey=='AmazonLinuxGhCliV2DocumentName'].OutputValue" --output text)
+  --query "Stacks[0].Outputs[?OutputKey=='AmazonLinuxSourceControlDocumentName'].OutputValue" --output text)
 INSTANCE=<i-0123456789abcdef0>
+
+# Pick ONE --parameters value:
+PARAMS="Action=RotateSshKey"                                  # server's own provider, keep 2
+PARAMS="Action=RotateSshKey,KeepKeys=1"                       # server's own provider, keep only the new key
+PARAMS="Action=RotateSshKey,Provider=GitHub"                  # GitHub key (ed25519), keep 2
+PARAMS="Action=RotateSshKey,Provider=AzureDevOps"             # Azure DevOps key (ssh-rsa), keep 2
+PARAMS="Action=RotateSshKey,Provider=AzureDevOps,KeepKeys=3"  # Azure DevOps key, keep the new one + 2 previous
 
 # Rotate the key and print the result
 CMD=$(aws ssm send-command --document-name "$DOC" --instance-ids "$INSTANCE" \
-  --parameters Action=RotateSshKey,KeepKeys=2 \
+  --parameters "$PARAMS" \
   --query "Command.CommandId" --output text)
 aws ssm wait command-executed --command-id "$CMD" --instance-id "$INSTANCE"
 aws ssm get-command-invocation --command-id "$CMD" --instance-id "$INSTANCE" \
   --query "StandardOutputContent" --output text
 ```
 
-In the console: **Systems Manager > Run Command > Run command**, pick the
-document, set `Action` to `RotateSshKey`, choose the instance, run, then open the
-instance's output. To rotate every dev server in the environment at once, replace
+To rotate every server with one provider at once, replace
 `--instance-ids "$INSTANCE"` with
-`--targets Key=tag:CloudDevEnvironment,Values=<value of the tag on your servers>`.
+`--targets Key=tag:CloudDevSourceProvider,Values=GitHub` (or `AzureDevOps`), then
+read each instance's output with `get-command-invocation`.
 
-**Shortcut script.** Servers with `GhCliMajorVersion=v2` get `rotate-github-key` in `/usr/local/bin`
-from the GitHub document's `Install` action at first boot (it is a copy of
-[cloud/dev/scripts/rotate-github-ssh-key.sh](cloud/dev/scripts/rotate-github-ssh-key.sh);
-CI checks the two match, so edit both together). It does the lookup, send, wait and output in one command. By default it targets the
-instance it runs on, finds the document by name and keeps 2 keys:
+**In the console:** Systems Manager > Run Command > Run command, pick the
+source control document, set `Action` to `RotateSshKey` (it defaults to `Setup`,
+which only reinstalls `rotate-git-key`), leave `Provider` at `auto` or pick
+`GitHub` / `AzureDevOps`, set `KeepKeys` if you want, choose the instance, run,
+then open the instance's output.
 
-```bash
-# already installed on dev servers; elsewhere (e.g. a laptop):
-install -m 0755 cloud/dev/scripts/rotate-github-ssh-key.sh ~/.local/bin/rotate-github-key
-rotate-github-key                         # this server, using the server role
-rotate-github-key -i i-0123456789abcdef0  # another server (-r region, -k keep, -d document)
-```
+#### Registering the new key
 
-On a dev server it needs no AWS profile: the shared server role may send this one
-document to dev servers of the same environment (it is not limited to the calling
-instance, because all of them share the role). From your laptop it uses your normal
-AWS login, and `-p <profile>` selects a different one anywhere.
+| | GitHub | Azure DevOps |
+| --- | --- | --- |
+| Add the key | Settings > SSH and GPG keys > New SSH key, or a repo's Settings > Deploy keys | User settings (top right) > SSH public keys > New Key |
+| Remove old keys | match the fingerprints printed under "Removed" | same |
+| Check on the server | `sudo -u ec2-user ssh -T git@github.com` → `Hi <name>!` | `sudo -u ec2-user ssh -T git@ssh.dev.azure.com` → `remote: Shell access is not supported.` |
+| Clone URL | `git@github.com:<owner>/<repo>.git` | `git@ssh.dev.azure.com:v3/<org>/<project>/<repo>` |
 
-Then register the printed public key and clean up the old one. With the GitHub CLI
-signed in wherever you are:
+With the GitHub CLI signed in, you can add and remove keys from the command line:
 
 ```bash
-# Add the new key (paste the printed public key and title)
 echo '<printed public key>' | gh ssh-key add - --title '<printed title>'
 # or, as a read-only deploy key on one repo
 echo '<printed public key>' | gh repo deploy-key add - --repo <owner>/<repo> --title '<printed title>'
-
-# Remove the key the run reported as deleted (match by the printed fingerprint)
-gh ssh-key list
-gh ssh-key delete <id>
+gh ssh-key list && gh ssh-key delete <id>
 ```
 
-Verify on the server: `sudo -u ec2-user ssh -T git@github.com` (a "Hi
-<name>!" reply means the key works). Run the document with `Action=Install` and
-a `GhCliVersion` only if you want to reinstall the CLI by hand; the association
-already does this with the environment stack's pinned `GhCliV2Version`.
+#### Re-running setup or the CLI install by hand
+
+The associations do this at launch and whenever their parameters change. To do
+it now on one server (e.g. to refresh `rotate-git-key` after updating the
+environment stack), leave the version parameters at their defaults (the stack's
+pinned versions):
+
+```bash
+aws ssm send-command --instance-ids "$INSTANCE" --document-name <AmazonLinuxSourceControlDocumentName output> \
+  --parameters Action=Setup
+aws ssm send-command --instance-ids "$INSTANCE" --document-name <AmazonLinuxGhCliV2DocumentName output>
+aws ssm send-command --instance-ids "$INSTANCE" --document-name <AmazonLinuxAzCliV2DocumentName output>
+```
 
 ## Deployment
 
@@ -274,7 +380,7 @@ already does this with the environment stack's pinned `GhCliV2Version`.
 
 ```bash
 aws cloudformation deploy \
-  --template-file cloud/dev/environment/cloud-dev-environment.yaml \
+  --template-file cloud/dev/cloud-dev-environment.yaml \
   --stack-name CloudDevEnv \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
@@ -292,7 +398,7 @@ aws cloudformation deploy \
 
 ```bash
 aws cloudformation deploy \
-  --template-file cloud/dev/server/cloud-dev-server-amazon-linux.yaml \
+  --template-file cloud/dev/cloud-dev-server-amazon-linux.yaml \
   --stack-name CloudDev-AmzLinux-1 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
@@ -341,7 +447,7 @@ associations. It grants no terminate and no arbitrary commands
 (`AWS-RunShellScript`).
 
 ```bash
-aws cloudformation deploy   --template-file cloud/dev/environment/cloud-dev-permission-set.yaml   --stack-name CloudDevPermissionSet   --parameter-overrides       InstanceArn=<arn:aws:sso:::instance/ssoins-...>       EnvironmentStackName=CloudDevEnv
+aws cloudformation deploy   --template-file cloud/dev/cloud-dev-permission-set.yaml   --stack-name CloudDevPermissionSet   --parameter-overrides       InstanceArn=<arn:aws:sso:::instance/ssoins-...>       EnvironmentStackName=CloudDevEnv
 ```
 
 - Deploy it in the Identity Center **management (or delegated administrator)
@@ -356,7 +462,7 @@ aws cloudformation deploy   --template-file cloud/dev/environment/cloud-dev-perm
 
 ## Private Ollama LLM server
 
-`cloud/dev/server/cloud-dev-ollama-server.yaml` runs [Ollama](https://ollama.com)
+`cloud/dev/cloud-dev-ollama-server.yaml` runs [Ollama](https://ollama.com)
 on a GPU instance (default `g6.xlarge`, 24 GB VRAM; Deep Learning Base AMI on
 Amazon Linux 2023) so dev servers can use an open-source model from the shell
 or an editor. It reuses the environment stack's instance profile (Session
@@ -369,7 +475,7 @@ access.
 
 ```bash
 # 1. Deploy the Ollama server (same VPC as your dev servers)
-aws cloudformation deploy   --template-file cloud/dev/server/cloud-dev-ollama-server.yaml   --stack-name CloudDevOllama   --parameter-overrides       VpcId=<vpc-id> SubnetId=<subnet-id>       OllamaModel=qwen2.5-coder:14b
+aws cloudformation deploy   --template-file cloud/dev/cloud-dev-ollama-server.yaml   --stack-name CloudDevOllama   --parameter-overrides       VpcId=<vpc-id> SubnetId=<subnet-id>       OllamaModel=qwen2.5-coder:14b
 
 # 2. Read the client security group and endpoint outputs
 aws cloudformation describe-stacks --stack-name CloudDevOllama   --query "Stacks[0].Outputs"
@@ -516,6 +622,7 @@ stops, so use the name only while the server is up.
 | `K6V1Version` | `1.8.2` | Exact k6 1.x release |
 | `AwsCliV2Version` | `2.38.5` | Exact AWS CLI 2.x release |
 | `GhCliV2Version` | `2.103.0` | Exact GitHub CLI 2.x release |
+| `AzCliV2Version` | `2.91.0` | Exact Azure CLI 2.x release (with the `azure-devops` extension) |
 | `DefaultNpmVersion` | `12.2.1` | Exact npm version |
 | `HostedZoneId` | *(empty)* | Optional Route 53 zone; registers DNS for each server (see [DNS](#dns-for-dev-servers-optional)) |
 | `VpcMode` | `none` | `none` / `public` / `public-private` |
