@@ -1,0 +1,74 @@
+name: Update pinned tool versions
+
+# Manually run: looks up the latest release of every pinned tool version on
+# the CloudDev environment stack (PowerShell, .NET, Playwright, k6, the AWS,
+# GitHub and Azure CLIs, npm) within its major, bumps the parameter defaults
+# and README, and opens a PR from a new branch. Does nothing if all versions
+# are current. DefaultNodeVersion is a major-version choice and is left alone.
+#
+# Requires Settings > Actions > General > "Allow GitHub Actions to create and
+# approve pull requests". PRs opened with GITHUB_TOKEN do not trigger other
+# workflows, so this job runs cfn-lint itself before opening the PR.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Update versions
+        id: update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/update-tool-versions.py > "$RUNNER_TEMP/pr-body.md"
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Lint the updated template
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          pip install cfn-lint
+          cfn-lint cloud/dev/cloud-dev-environment.yaml
+
+      - name: Open pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="update-tool-versions-$(date -u +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "Update pinned tool versions"
+          git push -u origin "$branch"
+          {
+            echo "Latest releases within each pinned major, found by the"
+            echo "\`Update pinned tool versions\` workflow."
+            echo
+            cat "$RUNNER_TEMP/pr-body.md"
+            echo
+            echo "After merging, update the environment stack and re-apply the"
+            echo "associations to roll the fleet forward."
+          } > "$RUNNER_TEMP/pr-full.md"
+          gh pr create --base "${{ github.ref_name }}" --head "$branch" \
+            --title "Update pinned tool versions" --body-file "$RUNNER_TEMP/pr-full.md"
