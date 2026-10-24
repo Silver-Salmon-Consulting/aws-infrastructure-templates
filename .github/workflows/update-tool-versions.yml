@@ -7,14 +7,16 @@ name: Update pinned tool versions
 # are current. DefaultNodeVersion is a major-version choice and is left alone.
 #
 # Requires Settings > Actions > General > "Allow GitHub Actions to create and
-# approve pull requests". PRs opened with GITHUB_TOKEN do not trigger other
-# workflows, so this job runs cfn-lint itself before opening the PR.
+# approve pull requests" (org and repo). A pull_request run triggered by the
+# bot's PR waits for approval, so after opening the PR this job dispatches
+# validate-templates on the new branch; its check lands on the PR's commit.
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   update:
@@ -72,3 +74,4 @@ jobs:
           } > "$RUNNER_TEMP/pr-full.md"
           gh pr create --base "${{ github.ref_name }}" --head "$branch" \
             --title "Update pinned tool versions" --body-file "$RUNNER_TEMP/pr-full.md"
+          gh workflow run validate-templates.yml --ref "$branch"
