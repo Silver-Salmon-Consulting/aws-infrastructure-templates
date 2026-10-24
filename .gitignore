@@ -1,2 +1,5 @@
 # Workflow scratch artifacts (planning/review notes from agent runs)
 .agents/
+
+# Python bytecode
+__pycache__/
