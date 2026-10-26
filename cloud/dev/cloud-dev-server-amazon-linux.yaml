@@ -691,7 +691,11 @@ Resources:
               # console output.
               (
                 set -x
+                # Update only the agents (not a full dnf upgrade) so they are current
+                # on every start; install is a no-op when already present.
+                dnf upgrade -y amazon-ssm-agent || echo "WARNING: SSM agent update failed; continuing."
                 dnf install -y amazon-cloudwatch-agent
+                dnf upgrade -y amazon-cloudwatch-agent
                 cat > /opt/aws/amazon-cloudwatch-agent/etc/bootstrap-logs.json <<'CWCONFIG'
               {
                 "logs": {

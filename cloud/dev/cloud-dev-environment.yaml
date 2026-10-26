@@ -1961,6 +1961,28 @@ Resources:
           Values:
             - enabled
 
+  # Weekly OS patching for every dev server in this environment (matched by
+  # the CloudDevEnvironment tag each server template sets to this stack's
+  # name). Uses the AL2023 default patch baseline via AWS-RunPatchBaseline.
+  # NoReboot: a reboot would interrupt a developer's session; kernel updates
+  # take effect at the next stop/start. Instances that are stopped at the
+  # scheduled time are patched on the next run (ApplyOnlyAtCronInterval off).
+  OsPatchAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-os-patch"
+      Name: AWS-RunPatchBaseline
+      ScheduleExpression: cron(0 3 ? * SUN *)
+      Parameters:
+        Operation:
+          - Install
+        RebootOption:
+          - NoReboot
+      Targets:
+        - Key: "tag:CloudDevEnvironment"
+          Values:
+            - !Ref AWS::StackName
+
   # Per-major-version associations. All k6 majors share one tag key and
   # differ by tag VALUE, so a server matches at most one of them; switching
   # the value and re-applying replaces /usr/local/bin/k6. Each passes its
