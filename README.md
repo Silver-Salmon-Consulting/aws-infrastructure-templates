@@ -81,11 +81,19 @@ then `ServerEnabled=true`. Nothing in `~/code` is lost.
 5. **Connect:** in VS Code run **Remote-SSH: Connect to Host… → my-dev-server**,
    then open the folder `/home/ec2-user/code`. The first connection takes a
    minute or two while VS Code installs its server.
-6. **GitHub:** `ForwardAgent yes` lets git on the server use the SSH key on your
-   own machine, so no key is stored on the server. Load it into your local
-   agent (`ssh-add ~/.ssh/id_ed25519`; on Windows, first enable the `ssh-agent`
-   service), then check on the server with `ssh -T git@github.com`. To give
-   the server its own key instead, see [Rotating the SSH key](#rotating-the-ssh-key).
+6. **GitHub (or Azure DevOps):** pick one.
+   - **Use your own key (no key on the server).** `ForwardAgent yes` lets git
+     on the server use the SSH key on your machine while you are connected.
+     Load it into your local agent (`ssh-add ~/.ssh/id_ed25519`; on Windows,
+     first enable the `ssh-agent` service), then check on the server with
+     `ssh -T git@github.com`.
+   - **Give the server its own key**, e.g. to pull while you are not connected.
+     On the server run `rotate-git-key`. It prints a new public key: add it in
+     GitHub under Settings → SSH and GPG keys, then check with
+     `ssh -T git@github.com`. Run it again to rotate; it lists the old keys to
+     delete in GitHub. The key is on the server's root disk, so a rebuilt
+     server needs a new one, and it takes precedence over a forwarded key.
+     Details: [Rotating the SSH key](#rotating-the-ssh-key).
 
 If it doesn't connect, test the tunnel on its own:
 `aws ssm start-session --target <instance-id> --region <region> --profile <profile>`.
