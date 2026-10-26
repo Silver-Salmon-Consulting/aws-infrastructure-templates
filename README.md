@@ -329,8 +329,8 @@ Software versions are set **once, on the environment stack**, as exact pinned
 defaults (current as of October 2026), so every server gets the same release:
 
 - `DefaultNodeVersion` (default `24`) — Node.js major version (22 / 24 / 26)
-- `PowerShell74Version` (`7.4.21`), `PowerShell76Version` (`7.6.8`, LTS)
-- `DotNet8Version` (`8.0.426`), `DotNet10Version` (`10.0.402`)
+- `PowerShell74Version` (`7.4.22`), `PowerShell76Version` (`7.6.9`, LTS)
+- `DotNet8Version` (`8.0.427`), `DotNet10Version` (`10.0.403`)
 - `PlaywrightVersion` (`1.64.1`)
 - `K6V0Version` (`0.59.0`), `K6V1Version` (`1.8.2`), `AwsCliV2Version` (`2.38.5`),
   `GhCliV2Version` (`2.103.2`), `AzCliV2Version` (`2.91.0`)
@@ -880,10 +880,10 @@ stops, so use the name only while the server is up.
 | `StackNamePrefix` | `CloudDev` | Scopes which stacks the shared role may signal |
 | `LogRetentionDays` | `7` | Bootstrap log retention |
 | `DefaultNodeVersion` | `24` | Fleet-wide Node.js version |
-| `PowerShell74Version` | `7.4.21` | Exact PowerShell 7.4.x release |
-| `PowerShell76Version` | `7.6.8` | Exact PowerShell 7.6.x release |
-| `DotNet8Version` | `8.0.426` | Exact .NET 8 SDK |
-| `DotNet10Version` | `10.0.402` | Exact .NET 10 SDK |
+| `PowerShell74Version` | `7.4.22` | Exact PowerShell 7.4.x release |
+| `PowerShell76Version` | `7.6.9` | Exact PowerShell 7.6.x release |
+| `DotNet8Version` | `8.0.427` | Exact .NET 8 SDK |
+| `DotNet10Version` | `10.0.403` | Exact .NET 10 SDK |
 | `PlaywrightVersion` | `1.64.1` | Playwright version to install Chromium for |
 | `K6V0Version` | `0.59.0` | Exact k6 0.x release |
 | `K6V1Version` | `1.8.2` | Exact k6 1.x release |
