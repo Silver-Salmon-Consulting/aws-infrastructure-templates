@@ -24,18 +24,22 @@ cloud/dev/
 
 ### Getting started
 
-#### For an admin: give someone a dev server
+Two roles: an **admin** sets up AWS and creates servers; a **developer**
+connects to one with VS Code.
 
-Once per AWS account:
+#### Admin setup
 
-1. Deploy the **environment stack** (`CloudDevEnv`); see
+##### Once per AWS account
+
+1. Deploy the **environment stack** (`CloudDevEnv`). See
    [Deploy the environment stack](#1-deploy-the-environment-stack).
-2. Deploy the **permission set** in the Identity Center account and assign it
-   to your developers for this account; see
+2. Deploy the **permission set** in the Identity Center account, and assign it
+   to your developers for this account. See
    [Deploy the developer permission set](#3-optional-deploy-the-developer-permission-set).
 
-For each developer and project, deploy a **server stack**. Its name must start
-with `CloudDev`:
+##### For each developer and project
+
+Deploy a **server stack**. Its name must start with `CloudDev`:
 
 ```bash
 aws cloudformation deploy \
@@ -47,56 +51,107 @@ aws cloudformation deploy \
       GitUserName="<name>" GitUserEmail=<email>
 ```
 
-Give the developer the stack's `InstanceId` output and the key pair's `.pem`
-file. Code lives on the stack's [workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds),
-so to rebuild the server later, update the stack with `ServerEnabled=false` and
-then `ServerEnabled=true`. Nothing in `~/code` is lost.
+Then give the developer:
 
-#### For a developer: connect with VS Code
+- the stack's `InstanceId` output;
+- the key pair's `.pem` file;
+- the AWS region and the name of the permission set to sign in with.
 
-1. **Install** the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),
-   the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
-   (Windows: `winget install Amazon.SessionManagerPlugin`) and the VS Code
-   **Remote - SSH** extension. Then fully quit and restart VS Code
-   (File → Exit), so it picks up the plugin on its PATH.
-2. **Sign in** to AWS with the CloudDev permission set:
-   `aws configure sso` once, then `aws sso login --profile <profile>` each day.
-3. **Save the key** your admin gave you as `~/.ssh/<key-pair>.pem`. On Windows,
-   make it private or SSH refuses it:
-   `icacls $env:USERPROFILE\.ssh\<key-pair>.pem /inheritance:r /grant:r "$($env:USERNAME):R"`.
-4. **Add the server** to `~/.ssh/config`:
+##### Rebuilding a server
 
-   ```
-   Host my-dev-server
-       HostName <instance-id>
-       User ec2-user
-       IdentityFile ~/.ssh/<key-pair>.pem
-       ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>
-       StrictHostKeyChecking accept-new
-       ForwardAgent yes
-   ```
+Update the stack with `ServerEnabled=false`, then again with
+`ServerEnabled=true`. The developer's code is on the stack's
+[workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds), so
+nothing in `~/code` is lost. The new server has a new `InstanceId`.
 
-   On Windows, wrap the `ProxyCommand` in PowerShell:
-   `ProxyCommand C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "aws ssm start-session ..."`.
-5. **Connect:** in VS Code run **Remote-SSH: Connect to Host… → my-dev-server**,
-   then open the folder `/home/ec2-user/code`. The first connection takes a
-   minute or two while VS Code installs its server.
-6. **GitHub (or Azure DevOps):** pick one.
-   - **Use your own key (no key on the server).** `ForwardAgent yes` lets git
-     on the server use the SSH key on your machine while you are connected.
-     Load it into your local agent (`ssh-add ~/.ssh/id_ed25519`; on Windows,
-     first enable the `ssh-agent` service), then check on the server with
-     `ssh -T git@github.com`.
-   - **Give the server its own key**, e.g. to pull while you are not connected.
-     On the server run `rotate-git-key`. It prints a new public key: add it in
-     GitHub under Settings → SSH and GPG keys, then check with
-     `ssh -T git@github.com`. Run it again to rotate; it lists the old keys to
-     delete in GitHub. The key is on the server's root disk, so a rebuilt
-     server needs a new one, and it takes precedence over a forwarded key.
-     Details: [Rotating the SSH key](#rotating-the-ssh-key).
+#### Developer setup
 
-If it doesn't connect, test the tunnel on its own:
-`aws ssm start-session --target <instance-id> --region <region> --profile <profile>`.
+##### 1. Install the tools
+
+- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+- [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  (Windows: `winget install Amazon.SessionManagerPlugin`)
+- The VS Code **Remote - SSH** extension
+
+Then fully quit VS Code (File → Exit) and start it again, so it picks up the
+plugin on its PATH.
+
+##### 2. Sign in to AWS
+
+Use the CloudDev permission set:
+
+```bash
+aws configure sso                      # once
+aws sso login --profile <profile>      # each day
+```
+
+##### 3. Save your key
+
+Save the `.pem` file from your admin as `~/.ssh/<key-pair>.pem`. On Windows,
+make it private, or SSH refuses to use it:
+
+```powershell
+icacls $env:USERPROFILE\.ssh\<key-pair>.pem /inheritance:r /grant:r "$($env:USERNAME):R"
+```
+
+##### 4. Add the server to your SSH config
+
+Add this to `~/.ssh/config`:
+
+```
+Host my-dev-server
+    HostName <instance-id>
+    User ec2-user
+    IdentityFile ~/.ssh/<key-pair>.pem
+    ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>
+    StrictHostKeyChecking accept-new
+    ForwardAgent yes
+```
+
+On Windows, wrap the `ProxyCommand` in PowerShell:
+
+```
+    ProxyCommand C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>"
+```
+
+##### 5. Connect with VS Code
+
+Run **Remote-SSH: Connect to Host… → my-dev-server**, then open the folder
+`/home/ec2-user/code`. The first connection takes a minute or two while VS
+Code installs its server.
+
+##### 6. Set up GitHub (or Azure DevOps) access
+
+Pick one.
+
+**Use your own key** (no key on the server). `ForwardAgent yes` lets git on
+the server use the SSH key on your machine while you are connected. Load the
+key into your local agent (on Windows, enable the `ssh-agent` service first):
+
+```bash
+ssh-add ~/.ssh/id_ed25519
+```
+
+**Give the server its own key**, e.g. to pull while you are not connected. On
+the server run `rotate-git-key`. It prints a new public key; add it in GitHub
+under Settings → SSH and GPG keys. Run it again to rotate: it lists the old
+keys to delete in GitHub. The key is on the server's root disk, so a rebuilt
+server needs a new one, and it takes precedence over a forwarded key. Details:
+[Rotating the SSH key](#rotating-the-ssh-key).
+
+Either way, check from the server:
+
+```bash
+ssh -T git@github.com     # "Hi <name>! You've successfully authenticated"
+```
+
+#### Troubleshooting
+
+Test the tunnel on its own first:
+
+```bash
+aws ssm start-session --target <instance-id> --region <region> --profile <profile>
+```
 
 | What you see | Fix |
 | --- | --- |
