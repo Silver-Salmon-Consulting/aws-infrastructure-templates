@@ -98,25 +98,41 @@ icacls $env:USERPROFILE\.ssh\<key-pair>.pem /inheritance:r /grant:r "$($env:USER
 
 ##### 4. Add the server to your SSH config
 
-Add this to `~/.ssh/config`:
+Copy the connect script into `~/.ssh`. It opens the SSH tunnel through Session
+Manager and, if the server was stopped (e.g. by the
+[idle auto-stop](#idle-auto-stop-safeguard)), **starts it first** and waits
+until it is reachable:
+
+- Windows: [`cloud/dev/scripts/clouddev-ssh-proxy.ps1`](cloud/dev/scripts/clouddev-ssh-proxy.ps1)
+- macOS / Linux: [`cloud/dev/scripts/clouddev-ssh-proxy.sh`](cloud/dev/scripts/clouddev-ssh-proxy.sh)
+  (then `chmod +x ~/.ssh/clouddev-ssh-proxy.sh`)
+
+Then add the server to `~/.ssh/config`. Windows:
 
 ```
 Host my-dev-server
     HostName <instance-id>
     User ec2-user
     IdentityFile ~/.ssh/<key-pair>.pem
-    ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>
+    ProxyCommand powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\<you>\.ssh\clouddev-ssh-proxy.ps1 %h %p <region> <profile>
     StrictHostKeyChecking accept-new
     ForwardAgent yes
 ```
 
-On Windows, wrap the `ProxyCommand` in PowerShell:
+macOS / Linux: the same, with
 
 ```
-    ProxyCommand C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>"
+    ProxyCommand ~/.ssh/clouddev-ssh-proxy.sh %h %p <region> <profile>
 ```
 
 ##### 5. Connect with VS Code
+
+Starting a stopped server takes a minute or two, longer than VS Code waits by
+default. Raise the timeout once in VS Code's settings (JSON):
+
+```json
+"remote.SSH.connectTimeout": 300
+```
 
 Run **Remote-SSH: Connect to Host… → my-dev-server**, then open the folder
 `/home/ec2-user/code`. The first connection takes a minute or two while VS
@@ -178,7 +194,8 @@ aws ssm start-session --target <instance-id> --region <region> --profile <profil
 | `Connection closed by UNKNOWN port 65535` | The `ProxyCommand` failed. Run the tunnel test above to see why |
 | `SSL validation failed ... CERTIFICATE_VERIFY_FAILED` | Antivirus or a proxy is inspecting HTTPS. Exclude `*.amazonaws.com` and `*.awsapps.com` from HTTPS scanning |
 | `AccessDeniedException ... ssm:StartSession` | Your permission set is missing the Session Manager rules. Ask an admin to redeploy it from this repo |
-| `TargetNotConnected` | The server is stopped (idle auto-stop). Start it, or wait a minute after a new deploy |
+| `TargetNotConnected` | The server is stopped (idle auto-stop). The connect script starts it for you; with a plain `aws ssm start-session` ProxyCommand, start it yourself, or wait a minute after a new deploy |
+| VS Code gives up while the server is starting | Raise `remote.SSH.connectTimeout` (step 5) |
 | Tunnel test works but VS Code fails | VS Code still has the PATH from before the plugin was installed. Fully quit and restart it |
 | `Token has expired` | `aws sso login --profile <profile>` |
 
@@ -839,7 +856,9 @@ the alarm has no action: an EventBridge rule sends its `ALARM` state change to a
 small Lambda (`IdleStopFunction`, allowed to stop only that one instance), which
 stops it. The instance stops (EBS persists; restart it later).
 A truly idle box you are connected to will still stop after the window — raise
-`IdleStopPeriods` or set `EnableIdleShutdown=false` if that is a problem.
+`IdleStopPeriods` or set `EnableIdleShutdown=false` if that is a problem. A stop
+keeps both disks; with the [connect script](#4-add-the-server-to-your-ssh-config)
+as your `ProxyCommand`, just reconnect and it starts the server again.
 
 ## DNS for dev servers (optional)
 
