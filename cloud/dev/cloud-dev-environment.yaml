@@ -170,38 +170,38 @@ Parameters:
     Type: String
     Description: >-
       Exact PowerShell 7.4.x release installed by the PowerShell 7.4 document.
-      7.4.21 is the latest 7.4 release (as of October 2026).
-    Default: "7.4.21"
+      7.4.22 is the latest 7.4 release (as of October 2026).
+    Default: "7.4.22"
     AllowedPattern: ^7\.4\.\d+$
-    ConstraintDescription: Must be a 7.4.x version, e.g. 7.4.21.
+    ConstraintDescription: Must be a 7.4.x version, e.g. 7.4.22.
 
   PowerShell76Version:
     Type: String
     Description: >-
       Exact PowerShell 7.6.x release installed by the PowerShell 7.6 document.
-      7.6.8 is the latest 7.6 release, the current LTS line (as of October
+      7.6.9 is the latest 7.6 release, the current LTS line (as of October
       2026).
-    Default: "7.6.8"
+    Default: "7.6.9"
     AllowedPattern: ^7\.6\.\d+$
-    ConstraintDescription: Must be a 7.6.x version, e.g. 7.6.8.
+    ConstraintDescription: Must be a 7.6.x version, e.g. 7.6.9.
 
   DotNet8Version:
     Type: String
     Description: >-
-      Exact .NET 8 SDK version installed by the .NET 8 document. 8.0.426 is
+      Exact .NET 8 SDK version installed by the .NET 8 document. 8.0.427 is
       the latest 8.0 SDK (as of October 2026).
-    Default: "8.0.426"
+    Default: "8.0.427"
     AllowedPattern: ^8\.0\.\d+$
-    ConstraintDescription: Must be an 8.0.x SDK version, e.g. 8.0.426.
+    ConstraintDescription: Must be an 8.0.x SDK version, e.g. 8.0.427.
 
   DotNet10Version:
     Type: String
     Description: >-
-      Exact .NET 10 SDK version installed by the .NET 10 document. 10.0.402 is
+      Exact .NET 10 SDK version installed by the .NET 10 document. 10.0.403 is
       the latest 10.0 SDK (as of October 2026).
-    Default: "10.0.402"
+    Default: "10.0.403"
     AllowedPattern: ^10\.0\.\d+$
-    ConstraintDescription: Must be a 10.0.x SDK version, e.g. 10.0.402.
+    ConstraintDescription: Must be a 10.0.x SDK version, e.g. 10.0.403.
 
   PlaywrightVersion:
     Type: String
