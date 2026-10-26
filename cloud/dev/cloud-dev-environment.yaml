@@ -30,6 +30,11 @@ Metadata:
           - VpcCidr
           - AllowedCidr
       - Label:
+          default: Workspace disk snapshots (optional)
+        Parameters:
+          - EnableWorkspaceSnapshots
+          - WorkspaceSnapshotRetain
+      - Label:
           default: Server software versions (fleet-wide, via SSM documents)
         Parameters:
           - DefaultNodeVersion
@@ -83,6 +88,10 @@ Metadata:
         default: VPC CIDR block
       AllowedCidr:
         default: Allowed SSH CIDR
+      EnableWorkspaceSnapshots:
+        default: Daily workspace snapshots
+      WorkspaceSnapshotRetain:
+        default: Workspace snapshots to keep
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -296,6 +305,27 @@ Parameters:
     AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
     ConstraintDescription: Must be a valid CIDR range, e.g. 203.0.113.4/32.
 
+  EnableWorkspaceSnapshots:
+    Type: String
+    Description: >-
+      Take a daily snapshot (05:00 UTC) of every server stack's workspace
+      volume with Data Lifecycle Manager, keeping the newest
+      WorkspaceSnapshotRetain. Snapshots are incremental, about $0.05 per
+      GB-month of changed data.
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  WorkspaceSnapshotRetain:
+    Type: Number
+    Description: >-
+      How many daily workspace snapshots to keep per volume. Only used when
+      EnableWorkspaceSnapshots is true.
+    Default: 7
+    MinValue: 1
+    MaxValue: 100
+
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
@@ -309,6 +339,7 @@ Conditions:
   PublicAz3: !And [!Condition CreateVpc, !Condition ThreeAzs]
   PrivateAz2: !And [!Condition CreatePrivate, !Condition TwoAzs]
   PrivateAz3: !And [!Condition CreatePrivate, !Condition ThreeAzs]
+  WorkspaceSnapshotsEnabled: !Equals [!Ref EnableWorkspaceSnapshots, "true"]
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -573,6 +604,28 @@ Resources:
               - Effect: Allow
                 Action: ec2:DescribeTags
                 Resource: "*"
+        # Lets the workspace document attach a server's workspace volume.
+        # AttachVolume is checked against the volume and the instance; both
+        # must be tagged CloudDevEnvironment=<this stack>. It is not limited
+        # to the calling instance's own volume, because every dev server
+        # shares this role. No DetachVolume: a volume is released when the
+        # instance holding it is terminated.
+        - PolicyName: AttachWorkspaceVolume
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:AttachVolume
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/CloudDevEnvironment: !Ref AWS::StackName
+              # Read-only; does not support resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeVolumes
+                Resource: "*"
         - PolicyName: WriteBootstrapLogs
           PolicyDocument:
             Version: "2012-10-17"
@@ -596,6 +649,67 @@ Resources:
     Properties:
       Roles:
         - !Ref DevServerRole
+
+  # Custom resource provider for server stacks: returns a subnet's
+  # Availability Zone (and VPC), so a server stack can create its workspace
+  # volume in the subnet's zone without asking for the zone. CloudFormation
+  # has no intrinsic function for this. Read-only.
+  SubnetLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: DescribeSubnets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read-only; does not support resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeSubnets
+                Resource: "*"
+
+  SubnetLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Custom resource that returns a subnet's Availability Zone and VPC.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt SubnetLookupRole.Arn
+      Code:
+        ZipFile: |
+          import logging
+
+          import boto3
+          import cfnresponse
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+
+          def handler(event, context):
+              physical_id = event.get("PhysicalResourceId", "subnet-lookup")
+              try:
+                  # Nothing to clean up; a lookup has no side effects.
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+                      return
+                  subnet_id = event["ResourceProperties"]["SubnetId"]
+                  subnet = boto3.client("ec2").describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+                  data = {"AvailabilityZone": subnet["AvailabilityZone"], "VpcId": subnet["VpcId"]}
+                  log.info("%s: %s", subnet_id, data)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data, subnet_id)
+              except Exception as exc:
+                  log.exception("subnet lookup failed")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, physical_id, reason=str(exc))
 
   # Managed, versioned SSM Command Document that installs Node.js/npm (via
   # nvm, system-wide under /opt/nvm) and wires /etc/profile.d/nvm.sh. This
@@ -1440,12 +1554,19 @@ Resources:
                   /usr/local/bin/rotate-git-key -h > /dev/null
 
                   # A directory ready for code, owned by ec2-user. Safe to re-run:
-                  # mkdir -p and chown on the directory itself only.
+                  # mkdir -p and chown on the directory itself only. Servers with a
+                  # workspace disk (CloudDevWorkspaceVolumeId tag) keep code in
+                  # ~/code on that disk, set up by the workspace document, so no
+                  # directory is made on the root disk unless one is asked for.
                   CODE_DIR="{{CodeDirectory}}"
-                  [ -n "$CODE_DIR" ] || CODE_DIR="/home/ec2-user/$SLUG"
-                  mkdir -p "$CODE_DIR"
-                  chown ec2-user:ec2-user "$CODE_DIR"
-                  chmod 0755 "$CODE_DIR"
+                  if [ -z "$CODE_DIR" ] && [ -n "$(tag CloudDevWorkspaceVolumeId)" ]; then
+                    echo "Code lives in ~/code on the workspace disk; no code directory created."
+                  else
+                    [ -n "$CODE_DIR" ] || CODE_DIR="/home/ec2-user/$SLUG"
+                    mkdir -p "$CODE_DIR"
+                    chown ec2-user:ec2-user "$CODE_DIR"
+                    chmod 0755 "$CODE_DIR"
+                  fi
 
                   # Git identity for ec2-user from the server stack's GitUserName /
                   # GitUserEmail (the CloudDevGitUserName / CloudDevGitUserEmail tags).
@@ -1458,6 +1579,201 @@ Resources:
                     [ -z "$GIT_NAME" ] || sudo -u ec2-user -H git config --global user.name "$GIT_NAME"
                     [ -z "$GIT_EMAIL" ] || sudo -u ec2-user -H git config --global user.email "$GIT_EMAIL"
                   fi
+
+  # Workspace disk: each server stack owns a separate EBS volume that outlives
+  # the server (rebuilds, AMI updates, ServerEnabled=false) and holds ec2-user's
+  # whole home (keys, logins, settings), code, package caches and the VS Code
+  # server. The stack tags the instance with the volume ID
+  # (CloudDevWorkspaceVolumeId); this document attaches that volume, formats it
+  # only if it has no file system, mounts it at /workspace, bind-mounts
+  # /workspace/home over /home/ec2-user, links ~/code and ~/.vscode-server into
+  # it and installs the packages in /workspace/packages.txt. The ATTACH is done here, not
+  # by CloudFormation, because CloudFormation creates a replacement instance
+  # before deleting the old one, so a stack-managed attachment would fail while
+  # the old instance still holds the volume. This waits for the old instance
+  # to let go instead. Runs every 30 minutes so a grown volume's file system
+  # is extended without a reboot; each run is a no-op when nothing changed.
+  AmazonLinuxWorkspaceDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      # No SSM parameters and NO ${...} CloudFormation variables.
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Attach this server's workspace EBS volume (from its
+          CloudDevWorkspaceVolumeId tag), format it if blank, mount it at
+          /workspace, grow the file system to the volume size, move
+          ec2-user's home onto it, point ~/code, ~/.vscode-server and the npm /
+          NuGet / pip caches at it, and install the packages listed in
+          /workspace/packages.txt.
+        mainSteps:
+          - action: aws:runShellScript
+            name: workspace
+            inputs:
+              # Allows for the wait on a replaced instance releasing the volume.
+              timeoutSeconds: "2400"
+              runCommand:
+                - |
+                  set -euo pipefail
+                  TOKEN=$(curl -sS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds:300" http://169.254.169.254/latest/api/token)
+                  imds() { curl -sS -H "X-aws-ec2-metadata-token:$TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+                  INSTANCE_ID=$(imds instance-id)
+                  REGION=$(imds placement/region)
+                  AZ=$(imds placement/availability-zone)
+                  VOLUME_ID=$(aws ec2 describe-tags --region "$REGION" \
+                    --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=CloudDevWorkspaceVolumeId" \
+                    --query 'Tags[0].Value' --output text)
+                  case "$VOLUME_ID" in
+                    vol-*) ;;
+                    *) echo "This server has no CloudDevWorkspaceVolumeId tag; nothing to do."; exit 0 ;;
+                  esac
+
+                  # Attach. A replacement instance starts while the old one still
+                  # holds the volume; wait (up to 35 minutes) for it to be released.
+                  DEADLINE=$((SECONDS + 2100))
+                  while :; do
+                    read -r STATE VOL_AZ ATTACHED_TO < <(aws ec2 describe-volumes --region "$REGION" --volume-ids "$VOLUME_ID" \
+                      --query 'Volumes[0].[State,AvailabilityZone,Attachments[0].InstanceId]' --output text)
+                    if [ "$VOL_AZ" != "$AZ" ]; then
+                      echo "Workspace volume $VOLUME_ID is in $VOL_AZ but this server is in $AZ. Update the server stack so the volume follows the subnet's zone." >&2
+                      exit 1
+                    fi
+                    [ "$ATTACHED_TO" = "$INSTANCE_ID" ] && break
+                    if [ "$STATE" = "available" ]; then
+                      echo "Attaching $VOLUME_ID..."
+                      aws ec2 attach-volume --region "$REGION" --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf > /dev/null || true
+                    else
+                      echo "$VOLUME_ID is $STATE (attached to $ATTACHED_TO); waiting for it to be released..."
+                    fi
+                    if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                      echo "Timed out waiting to attach $VOLUME_ID; the next scheduled run retries." >&2
+                      exit 1
+                    fi
+                    sleep 15
+                  done
+
+                  # Nitro instances expose EBS volumes as NVMe devices named by volume ID.
+                  DEV="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOLUME_ID/-/}"
+                  for _ in $(seq 60); do [ -e "$DEV" ] && break; sleep 2; done
+                  [ -e "$DEV" ] || DEV=/dev/xvdf
+                  [ -e "$DEV" ] || { echo "Device for $VOLUME_ID not found." >&2; exit 1; }
+                  DEV=$(readlink -f "$DEV")
+
+                  # Format ONLY a blank volume (blkid finds no file system). A volume
+                  # with data, or restored from a snapshot, is never formatted.
+                  if ! blkid "$DEV" > /dev/null 2>&1; then
+                    echo "Formatting new workspace volume $VOLUME_ID ($DEV)..."
+                    mkfs.xfs -L workspace "$DEV"
+                  fi
+                  UUID=$(blkid -s UUID -o value "$DEV")
+
+                  # Mount by UUID; nofail so the server still boots without it. All of
+                  # ec2-user's home is bind-mounted from /workspace/home, so keys,
+                  # logins and settings survive rebuilds and AMI updates; a new stack
+                  # starts with a fresh home.
+                  mkdir -p /workspace
+                  sed -i -e '\# /workspace #d' -e '\# /home/ec2-user #d' /etc/fstab
+                  echo "UUID=$UUID /workspace xfs defaults,nofail 0 2" >> /etc/fstab
+                  echo "/workspace/home /home/ec2-user none bind,nofail,x-systemd.requires-mounts-for=/workspace 0 0" >> /etc/fstab
+                  systemctl daemon-reload
+                  mountpoint -q /workspace || mount /workspace
+                  # Extend the file system after the stack grows the volume (no-op otherwise).
+                  xfs_growfs /workspace > /dev/null
+
+                  install -d -o ec2-user -g ec2-user /workspace/code /workspace/vscode-server \
+                    /workspace/cache /workspace/cache/npm /workspace/cache/nuget /workspace/cache/pip
+
+                  # Move the home onto the workspace. The first time, the server's
+                  # current home is copied in. On a later instance (rebuild, AMI
+                  # update) the workspace's home is kept and only this server's
+                  # authorized_keys (the stack's key pair, written at first boot) is
+                  # taken, so a changed KeyPairName still logs in.
+                  HOME_MOVED=0
+                  if ! mountpoint -q /home/ec2-user; then
+                    if [ ! -d /workspace/home ]; then
+                      echo "Copying /home/ec2-user to the workspace..."
+                      mkdir /workspace/home
+                      cp -a /home/ec2-user/. /workspace/home/
+                    elif [ -f /home/ec2-user/.ssh/authorized_keys ]; then
+                      install -d -m 700 -o ec2-user -g ec2-user /workspace/home/.ssh
+                      install -m 600 -o ec2-user -g ec2-user /home/ec2-user/.ssh/authorized_keys /workspace/home/.ssh/authorized_keys
+                    fi
+                    chown ec2-user:ec2-user /workspace/home
+                    chmod 700 /workspace/home
+                    mount /home/ec2-user
+                    HOME_MOVED=1
+                    echo "ec2-user's home is now on the workspace; reconnect sessions opened before this."
+                  fi
+
+                  # The source control document may have set the git identity in the
+                  # old home before the move; apply the stack's values again.
+                  if [ "$HOME_MOVED" = 1 ]; then
+                    TAGS=$(aws ec2 describe-tags --region "$REGION" --filters "Name=resource-id,Values=$INSTANCE_ID" \
+                      --query 'Tags[].[Key,Value]' --output text)
+                    tag() { printf '%s\n' "$TAGS" | awk -F'\t' -v k="$1" '$1==k{print $2}'; }
+                    GIT_NAME=$(tag CloudDevGitUserName)
+                    GIT_EMAIL=$(tag CloudDevGitUserEmail)
+                    if [ -n "$GIT_NAME$GIT_EMAIL" ] && command -v git > /dev/null; then
+                      [ -z "$GIT_NAME" ] || sudo -u ec2-user -H git config --global user.name "$GIT_NAME"
+                      [ -z "$GIT_EMAIL" ] || sudo -u ec2-user -H git config --global user.email "$GIT_EMAIL"
+                    fi
+                  fi
+
+                  # Extra dnf packages the developer lists in /workspace/packages.txt
+                  # (one per line, # for comments), reinstalled on every new server.
+                  # ec2-user can already sudo, so this grants nothing new.
+                  PKG_FILE=/workspace/packages.txt
+                  if [ ! -e "$PKG_FILE" ]; then
+                    printf '%s\n' "# Extra dnf packages for this server, one per line (e.g. htop)." \
+                      "# Installed on every new server and within 30 minutes of being added." > "$PKG_FILE"
+                    chown ec2-user:ec2-user "$PKG_FILE"
+                  fi
+                  MISSING=()
+                  while read -r PKG _; do
+                    case "$PKG" in ""|"#"*) continue ;; esac
+                    if [[ ! "$PKG" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+                      echo "WARNING: skipping '$PKG' in $PKG_FILE (not a package name)." >&2
+                      continue
+                    fi
+                    rpm -q "$PKG" > /dev/null 2>&1 || MISSING+=("$PKG")
+                  done < "$PKG_FILE"
+                  if [ "${#MISSING[@]}" -gt 0 ]; then
+                    echo "Installing from $PKG_FILE: ${MISSING[*]}"
+                    dnf install -y "${MISSING[@]}" || echo "WARNING: dnf install failed; the next run retries." >&2
+                  fi
+
+                  # Point a path in ec2-user's home at the workspace. An existing real
+                  # directory is moved in when the workspace has nothing there yet;
+                  # otherwise it is left alone with a warning, never deleted.
+                  link_home() {
+                    local link="/home/ec2-user/$1" target="$2"
+                    if [ -L "$link" ]; then
+                      ln -sfn "$target" "$link"
+                    elif [ -e "$link" ]; then
+                      if [ -z "$(ls -A "$target")" ]; then
+                        cp -a "$link/." "$target/" && rm -rf "$link" && ln -s "$target" "$link"
+                      else
+                        echo "WARNING: $link exists on the root disk and $target is not empty; left as is." >&2
+                        return 0
+                      fi
+                    else
+                      ln -s "$target" "$link"
+                    fi
+                    chown -h ec2-user:ec2-user "$link"
+                  }
+                  link_home code /workspace/code
+                  link_home .vscode-server /workspace/vscode-server
+
+                  cat > /etc/profile.d/clouddev-workspace.sh <<'PROFILE_EOF'
+                  # Package caches on the workspace disk, so they survive server rebuilds.
+                  export npm_config_cache=/workspace/cache/npm
+                  export NUGET_PACKAGES=/workspace/cache/nuget
+                  export PIP_CACHE_DIR=/workspace/cache/pip
+                  PROFILE_EOF
+
+                  df -h /workspace
 
   # Automation runbooks that let developers start, stop and restart a dev
   # server from Systems Manager > Automation > Execute. No AssumeRole is set,
@@ -1729,6 +2045,63 @@ Resources:
           Values:
             - GitHub
             - AzureDevOps
+
+  # Attaches and mounts the workspace disk on every server stack that has one
+  # (they all tag CloudDevWorkspaceConfig=enabled). Unlike the install
+  # associations this one is scheduled: it retries an attach that timed out
+  # and extends the file system after the volume grows.
+  WorkspaceConfigAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-workspace"
+      Name: !Ref AmazonLinuxWorkspaceDocument
+      ScheduleExpression: rate(30 minutes)
+      Targets:
+        - Key: "tag:CloudDevWorkspaceConfig"
+          Values:
+            - enabled
+
+  # Optional daily snapshots of every workspace volume of this environment
+  # (tagged CloudDevWorkspace=<this stack>), keeping the newest
+  # WorkspaceSnapshotRetain. Independent of the final snapshot CloudFormation
+  # takes when a server stack is deleted.
+  WorkspaceSnapshotRole:
+    Type: AWS::IAM::Role
+    Condition: WorkspaceSnapshotsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+
+  WorkspaceSnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Condition: WorkspaceSnapshotsEnabled
+    Properties:
+      Description: !Sub "Daily snapshots of ${AWS::StackName} workspace volumes"
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt WorkspaceSnapshotRole.Arn
+      PolicyDetails:
+        ResourceTypes:
+          - VOLUME
+        TargetTags:
+          - Key: CloudDevWorkspace
+            Value: !Ref AWS::StackName
+        Schedules:
+          - Name: Daily
+            CopyTags: true
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times:
+                - "05:00"
+            RetainRule:
+              Count: !Ref WorkspaceSnapshotRetain
 
   # ---- VPC + public networking (created when VpcMode != none) ----
   Vpc:
@@ -2131,6 +2504,23 @@ Outputs:
     Value: !Ref AmazonLinuxSourceControlDocument
     Export:
       Name: !Sub "${AWS::StackName}-AmazonLinuxSourceControlDocumentName"
+
+  SubnetLookupFunctionArn:
+    Description: >-
+      ServiceToken for the subnet lookup custom resource that server stacks
+      use to find their subnet's Availability Zone.
+    Value: !GetAtt SubnetLookupFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetLookupFunctionArn"
+
+  AmazonLinuxWorkspaceDocumentName:
+    Description: >-
+      Name of the shared SSM Command Document that attaches, mounts and grows
+      a server stack's workspace volume at /workspace on Amazon Linux dev
+      servers.
+    Value: !Ref AmazonLinuxWorkspaceDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-AmazonLinuxWorkspaceDocumentName"
 
   # Fleet-wide software versions: the pinned parameters above, echoed so the
   # stack's Outputs tab shows what the associations install. (Output names

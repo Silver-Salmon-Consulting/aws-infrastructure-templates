@@ -179,14 +179,20 @@ Resources:
               - arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell
               - arn:aws:ssm:*:*:document/AWS-StartSSHSession
 
-          # End or resume only your own sessions (session IDs start with the
-          # caller's user ID).
+          # End or resume only your own sessions. Session Manager tags each
+          # session with its starter's user ID (aws:ssmmessages:session-id).
+          # Matching the session ID prefix instead fails for Identity Center
+          # users: their sessions are named after the role session name
+          # (e.g. "DaveN-..."), not aws:userid ("AROA...:DaveN").
           - Sid: ManageOwnSessions
             Effect: Allow
             Action:
               - ssm:TerminateSession
               - ssm:ResumeSession
-            Resource: "arn:aws:ssm:*:*:session/${aws:userid}-*"
+            Resource: arn:aws:ssm:*:*:session/*
+            Condition:
+              StringLike:
+                ssm:resourceTag/aws:ssmmessages:session-id: "${aws:userid}"
 
           - Sid: DescribeSessions
             Effect: Allow
