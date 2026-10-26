@@ -120,30 +120,49 @@ Run **Remote-SSH: Connect to Host… → my-dev-server**, then open the folder
 `/home/ec2-user/code`. The first connection takes a minute or two while VS
 Code installs its server.
 
-##### 6. Set up GitHub (or Azure DevOps) access
+##### 6. Give the server a Git SSH key with `rotate-git-key`
 
-Pick one.
+Every server has `rotate-git-key`, which makes an SSH key for GitHub (or Azure
+DevOps, if that is the server's source provider). In VS Code's terminal on the
+server:
 
-**Use your own key** (no key on the server). `ForwardAgent yes` lets git on
-the server use the SSH key on your machine while you are connected. Load the
-key into your local agent (on Windows, enable the `ssh-agent` service first):
+1. Create the key:
 
-```bash
-ssh-add ~/.ssh/id_ed25519
-```
+   ```bash
+   rotate-git-key
+   ```
 
-**Give the server its own key**, e.g. to pull while you are not connected. On
-the server run `rotate-git-key`. It prints a new public key; add it in GitHub
-under Settings → SSH and GPG keys. Run it again to rotate: it lists the old
-keys to delete in GitHub. The key is on the server's root disk, so a rebuilt
-server needs a new one, and it takes precedence over a forwarded key. Details:
-[Rotating the SSH key](#rotating-the-ssh-key).
+   It prints the new **public** key and a title named after the server. The
+   private key never leaves the server.
+2. Add the public key where the output says:
+   - **GitHub:** Settings → SSH and GPG keys → New SSH key
+   - **Azure DevOps:** User settings → SSH public keys → New Key
+3. Check it works:
 
-Either way, check from the server:
+   ```bash
+   ssh -T git@github.com     # "Hi <name>! You've successfully authenticated"
+   ```
 
-```bash
-ssh -T git@github.com     # "Hi <name>! You've successfully authenticated"
-```
+4. Clone into `~/code`:
+
+   ```bash
+   cd ~/code && git clone git@github.com:<owner>/<repo>.git
+   ```
+
+**Rotating later:** run `rotate-git-key` again and add the new key. It keeps
+the previous key for rollback and lists any older ones it removed, which you
+then delete in GitHub. More options: [Rotating the SSH key](#rotating-the-ssh-key).
+
+**After a rebuild:** the key is on the server's root disk, not the workspace,
+so a rebuilt server needs `rotate-git-key` again (delete the old server's key
+in GitHub).
+
+**Alternative: use your own key instead.** With `ForwardAgent yes` in your SSH
+config, git on the server can use the key on your own machine while you are
+connected, and no key is stored on the server. Load it into your local agent
+(on Windows, enable the `ssh-agent` service first) with
+`ssh-add ~/.ssh/id_ed25519`. A key made by `rotate-git-key` takes precedence
+over a forwarded one.
 
 #### Troubleshooting
 
