@@ -22,6 +22,83 @@ cloud/dev/
   cloud-dev-ollama-server.yaml            # private GPU Ollama LLM server
 ```
 
+### Getting started
+
+#### For an admin: give someone a dev server
+
+Once per AWS account:
+
+1. Deploy the **environment stack** (`CloudDevEnv`); see
+   [Deploy the environment stack](#1-deploy-the-environment-stack).
+2. Deploy the **permission set** in the Identity Center account and assign it
+   to your developers for this account; see
+   [Deploy the developer permission set](#3-optional-deploy-the-developer-permission-set).
+
+For each developer and project, deploy a **server stack**. Its name must start
+with `CloudDev`:
+
+```bash
+aws cloudformation deploy \
+  --template-file cloud/dev/cloud-dev-server-amazon-linux-arm.yaml \
+  --stack-name CloudDev-MyProject-Arm-1 \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+      KeyPairName=<key-pair> VpcId=<vpc-id> SubnetId=<subnet-id> \
+      GitUserName="<name>" GitUserEmail=<email>
+```
+
+Give the developer the stack's `InstanceId` output and the key pair's `.pem`
+file. Code lives on the stack's [workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds),
+so to rebuild the server later, update the stack with `ServerEnabled=false` and
+then `ServerEnabled=true`. Nothing in `~/code` is lost.
+
+#### For a developer: connect with VS Code
+
+1. **Install** the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),
+   the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+   (Windows: `winget install Amazon.SessionManagerPlugin`) and the VS Code
+   **Remote - SSH** extension. Then fully quit and restart VS Code
+   (File → Exit), so it picks up the plugin on its PATH.
+2. **Sign in** to AWS with the CloudDev permission set:
+   `aws configure sso` once, then `aws sso login --profile <profile>` each day.
+3. **Save the key** your admin gave you as `~/.ssh/<key-pair>.pem`. On Windows,
+   make it private or SSH refuses it:
+   `icacls $env:USERPROFILE\.ssh\<key-pair>.pem /inheritance:r /grant:r "$($env:USERNAME):R"`.
+4. **Add the server** to `~/.ssh/config`:
+
+   ```
+   Host my-dev-server
+       HostName <instance-id>
+       User ec2-user
+       IdentityFile ~/.ssh/<key-pair>.pem
+       ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>
+       StrictHostKeyChecking accept-new
+       ForwardAgent yes
+   ```
+
+   On Windows, wrap the `ProxyCommand` in PowerShell:
+   `ProxyCommand C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "aws ssm start-session ..."`.
+5. **Connect:** in VS Code run **Remote-SSH: Connect to Host… → my-dev-server**,
+   then open the folder `/home/ec2-user/code`. The first connection takes a
+   minute or two while VS Code installs its server.
+6. **GitHub:** `ForwardAgent yes` lets git on the server use the SSH key on your
+   own machine, so no key is stored on the server. Load it into your local
+   agent (`ssh-add ~/.ssh/id_ed25519`; on Windows, first enable the `ssh-agent`
+   service), then check on the server with `ssh -T git@github.com`. To give
+   the server its own key instead, see [Rotating the SSH key](#rotating-the-ssh-key).
+
+If it doesn't connect, test the tunnel on its own:
+`aws ssm start-session --target <instance-id> --region <region> --profile <profile>`.
+
+| What you see | Fix |
+| --- | --- |
+| `Connection closed by UNKNOWN port 65535` | The `ProxyCommand` failed. Run the tunnel test above to see why |
+| `SSL validation failed ... CERTIFICATE_VERIFY_FAILED` | Antivirus or a proxy is inspecting HTTPS. Exclude `*.amazonaws.com` and `*.awsapps.com` from HTTPS scanning |
+| `AccessDeniedException ... ssm:StartSession` | Your permission set is missing the Session Manager rules. Ask an admin to redeploy it from this repo |
+| `TargetNotConnected` | The server is stopped (idle auto-stop). Start it, or wait a minute after a new deploy |
+| Tunnel test works but VS Code fails | VS Code still has the PATH from before the plugin was installed. Fully quit and restart it |
+| `Token has expired` | `aws sso login --profile <profile>` |
+
 ### Architecture
 
 - **Environment stack** (`cloud-dev-environment.yaml`) — the shared foundation,
@@ -38,8 +115,13 @@ cloud/dev/
     and 1.x, AWS CLI 2.x, GitHub CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
   - **tag-targeted** SSM State Manager associations that apply those
     documents to any instance carrying the matching tag;
+  - a workspace document and association that attach and mount each server's
+    [workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds),
+    optional daily snapshots of those disks, and a subnet lookup function that
+    tells server stacks their subnet's Availability Zone;
   - an optional VPC (`public` or `public-private`, 1–3 AZs).
-- **Server stacks** (`cloud-dev-server-*.yaml`) — each launches one EC2 instance.
+- **Server stacks** (`cloud-dev-server-*.yaml`) — each launches one EC2 instance
+  and owns a separate workspace disk for code and caches that outlives it.
   A server imports the IAM instance profile and log group from the environment
   stack by name, and **tags itself** to opt into the shared SSM associations. It
   does not define its own SSM documents or associations.
@@ -74,6 +156,8 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `AzCliV2ConfigAssociation` targets `tag:CloudDevAzCliConfig = v2`
    - `SourceControlConfigAssociation` targets `tag:CloudDevSourceProvider = GitHub`
      or `AzureDevOps` (see [Source control](#source-control-github-or-azure-devops))
+   - `WorkspaceConfigAssociation` targets `tag:CloudDevWorkspaceConfig = enabled`
+     and, unlike the others, re-runs every 30 minutes (see [Workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds))
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
    - `CloudDevPowerShellConfig = <PowerShellVersion>` (`none` / `v7.4` / `v7.6`,
@@ -90,6 +174,8 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
      `CloudDevAzCliConfig = v2` for Azure DevOps (`none` otherwise)
    - `CloudDevGitUserName = <GitUserName>` and `CloudDevGitUserEmail =
      <GitUserEmail>`, each only when set (default empty)
+   - `CloudDevWorkspaceConfig = enabled` (always) and
+     `CloudDevWorkspaceVolumeId = <the stack's workspace volume>`
 
 The .NET SDK installs into `/opt/dotnet` (via Microsoft's `dotnet-install.sh`,
 x64 or arm64 automatically), with `/usr/bin/dotnet` symlinked and `DOTNET_ROOT`
@@ -197,7 +283,7 @@ instance's `CloudDevSourceProvider` tag and decides what the server gets:
 | SSH key `rotate-git-key` makes | ed25519 | 4096-bit `ssh-rsa` (Azure DevOps accepts only RSA) |
 | Hosts in the managed `~/.ssh/config` block | `github.com` | `ssh.dev.azure.com`, `vs-ssh.visualstudio.com` |
 | Keys on the server | `~/.ssh/github/` | `~/.ssh/azuredevops/` |
-| Code directory | `/home/ec2-user/github` | `/home/ec2-user/azuredevops` |
+| Code directory | `~/code` (on the workspace disk) | `~/code` (on the workspace disk) |
 
 Both get `rotate-git-key` in `/usr/local/bin` (`rotate-github-key` still works as
 a link to it). git itself comes with the Node document. `none` sets up neither.
@@ -205,12 +291,15 @@ a link to it). git itself comes with the Node document. `none` sets up neither.
 Three documents do this:
 
 - **`AmazonLinuxSourceControlDocument`** (provider-neutral). `Action=Setup` (run
-  by its association on every server with a provider) installs `rotate-git-key`,
-  creates the code directory (override with `CodeDirectory`; existing
-  contents are never touched) and sets `ec2-user`'s global git `user.name` /
+  by its association on every server with a provider) installs `rotate-git-key`
+  and sets `ec2-user`'s global git `user.name` /
   `user.email` from the stack's optional **`GitUserName`** / **`GitUserEmail`**
-  (an empty one is left alone). `Action=RotateSshKey` is **on demand only**;
-  nothing runs it automatically.
+  (an empty one is left alone). Code goes in `~/code` on the
+  [workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds); on a
+  server without one (or with `CodeDirectory` set) it creates
+  `/home/ec2-user/github` or `/home/ec2-user/azuredevops` instead, never touching
+  existing contents. `Action=RotateSshKey` is **on demand only**; nothing runs it
+  automatically.
 - **`AmazonLinuxGhCliV2Document`** installs `gh` (`CloudDevGhCliConfig = v2`).
 - **`AmazonLinuxAzCliV2Document`** installs `az` from Microsoft's RHEL 9 RPM
   (x86_64 or arm64, pinned, signature-checked; no repo is added) and the
@@ -419,6 +508,10 @@ aws cloudformation deploy \
       SubnetId=<public-subnet-id>
 ```
 
+The [workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds) is
+created in the subnet's Availability Zone, which the stack looks up with the
+environment stack's `SubnetLookupFunction` (a custom resource).
+
 Use the ARM template (`...-arm.yaml`) for a Graviton instance; it is otherwise
 identical.
 
@@ -560,6 +653,60 @@ shell on the server, so assign the permission set accordingly.
 > targets the instance ID, which never changes. The default login user for Amazon
 > Linux is `ec2-user`.
 
+## Workspace disk: code and caches that survive rebuilds
+
+Each server stack owns two disks:
+
+| Disk | Holds | Lifetime |
+| --- | --- | --- |
+| Root (`VolumeSize`, default 30 GiB) | OS, installed tools, SSH and git keys, `~/.aws` and other credentials | Replaced with the server; never shared |
+| Workspace (`WorkspaceVolumeSize`, default 20 GiB), at `/workspace` | `~/code`, the npm / NuGet / pip caches, `~/.vscode-server` | Belongs to the stack; kept when the server is rebuilt |
+
+The stack creates the workspace volume and tags the instance with its ID. The
+environment stack's `AmazonLinuxWorkspaceDocument` (run by
+`WorkspaceConfigAssociation`) then:
+
+1. attaches the volume. If a replaced server still holds it, it waits (up to 35
+   minutes) for CloudFormation to terminate the old one. CloudFormation cannot
+   attach it itself, because it creates the new server before deleting the old;
+2. formats it **only** if it has no file system, and mounts it at `/workspace`
+   (by UUID in `/etc/fstab`, with `nofail`);
+3. links `~/code` and `~/.vscode-server` into it and sets `npm_config_cache`,
+   `NUGET_PACKAGES` and `PIP_CACHE_DIR` in `/etc/profile.d/clouddev-workspace.sh`.
+
+It re-runs every 30 minutes; each run is a no-op unless something changed, and
+it grows the file system after `WorkspaceVolumeSize` is raised.
+
+What happens to the workspace when you change the stack:
+
+| Change | Server | Workspace |
+| --- | --- | --- |
+| Instance type, tools, git name/email | Updated in place | Kept |
+| AMI update (`LatestAmiId` re-resolves on every update), subnet in the same zone | Replaced | Kept, reattached |
+| `ServerEnabled=false`, then `true` (rebuild) | Deleted, then new | Kept |
+| `ServerEnabled=false` and leave it (park a project) | Deleted | Kept; you pay only for the disk |
+| Larger `WorkspaceVolumeSize` | Unchanged | Grown in place |
+| Smaller `WorkspaceVolumeSize` | Unchanged | Kept; EBS cannot shrink, so the update fails and rolls back |
+| `SubnetId` in another zone, or `WorkspaceSnapshotId` | — | Replaced in the new zone / from the snapshot; the old one is snapshotted. Change these only while `ServerEnabled=false` |
+| Delete the stack | Deleted | Final snapshot, then deleted |
+
+To restore a workspace (into a new stack, or another Availability Zone), pass
+the snapshot as `WorkspaceSnapshotId`. For regular backups, set the environment
+stack's `EnableWorkspaceSnapshots=true`: Data Lifecycle Manager snapshots every
+workspace volume daily at 05:00 UTC and keeps the newest
+`WorkspaceSnapshotRetain` (default 7). Snapshots cannot skip folders, so the
+caches are backed up too.
+
+The dev server role can attach any volume tagged with its environment to any of
+the environment's servers (all servers share the role), so workspaces are
+separated by stack, not enforced between users.
+
+**Existing servers:** updating a server stack from these templates adds an empty
+workspace and links `~/code` to it; existing folders such as `~/github` stay on
+the root disk. Move what you want to keep into `~/code`, because the root disk
+is lost the next time the server is replaced (e.g. by an AMI update, which any
+stack update can pick up).
+
 ## Idle auto-stop safeguard
 
 Each server creates a CloudWatch alarm that **stops** (not terminates) the
@@ -639,6 +786,8 @@ stops, so use the name only while the server is up.
 | `AzCount` | `1` | Availability Zones (1–3) when a VPC is created |
 | `VpcCidr` | `10.0.0.0/16` | VPC CIDR when a VPC is created |
 | `AllowedCidr` | *(required)* | SSH source CIDR for the dev-server security group |
+| `EnableWorkspaceSnapshots` | `false` | Daily snapshots of every server's workspace disk |
+| `WorkspaceSnapshotRetain` | `7` | Daily workspace snapshots kept per disk |
 
 ## Validation
 

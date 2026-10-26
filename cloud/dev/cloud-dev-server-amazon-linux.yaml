@@ -31,6 +31,12 @@ Metadata:
           - VolumeSize
           - LatestAmiId
       - Label:
+          default: Workspace disk (code and caches; survives server rebuilds)
+        Parameters:
+          - ServerEnabled
+          - WorkspaceVolumeSize
+          - WorkspaceSnapshotId
+      - Label:
           default: Idle auto-stop safeguard
         Parameters:
           - EnableIdleShutdown
@@ -72,6 +78,12 @@ Metadata:
         default: Root volume size (GiB)
       LatestAmiId:
         default: AMI (SSM parameter)
+      ServerEnabled:
+        default: Server enabled
+      WorkspaceVolumeSize:
+        default: Workspace volume size (GiB)
+      WorkspaceSnapshotId:
+        default: Restore workspace from snapshot (optional)
       EnableIdleShutdown:
         default: Enable idle auto-stop
       IdleCpuThresholdPercent:
@@ -184,7 +196,10 @@ Parameters:
 
   VolumeSize:
     Type: Number
-    Description: Root EBS volume size in GiB.
+    Description: >-
+      Root EBS volume size in GiB: the OS, installed tools, SSH keys and
+      credentials. It is replaced with the server; code and caches live on the
+      workspace volume instead.
     Default: 30
     MinValue: 8
     MaxValue: 1000
@@ -196,6 +211,45 @@ Parameters:
       SSM parameter that resolves to the latest Amazon Linux 2023 AMI.
       Leave as the default unless you have a reason to change it.
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+
+  # The workspace volume belongs to the stack, not the server: rebuilding the
+  # server (ServerEnabled false then true, or an AMI update that replaces it)
+  # keeps it, and deleting the stack leaves a final snapshot.
+  ServerEnabled:
+    Type: String
+    Description: >-
+      "false" deletes the server (and its root volume) but keeps the
+      workspace volume; set it back to "true" to get a fresh server with the
+      same workspace. Use it to rebuild a server or to park a project.
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+
+  WorkspaceVolumeSize:
+    Type: Number
+    Description: >-
+      Workspace volume size in GiB, mounted at /workspace (~/code, package
+      caches, VS Code server). Can be increased later without a rebuild (the
+      file system grows within 30 minutes); EBS volumes cannot shrink.
+    Default: 20
+    MinValue: 1
+    MaxValue: 1000
+
+
+  WorkspaceSnapshotId:
+    Type: String
+    Description: >-
+      Optional. Create the workspace volume from this EBS snapshot, e.g. the
+      final snapshot of a deleted stack or one taken before moving to another
+      Availability Zone. Leave empty for a new, empty workspace. Change it
+      (or move SubnetId to another zone) only while ServerEnabled is "false":
+      it replaces the volume, and the old one is snapshotted.
+    Default: ""
+    AllowedPattern: ^(snap-[0-9a-f]{8,17})?$
+    ConstraintDescription: Must be empty or a snapshot ID, e.g. snap-0123456789abcdef0.
 
 
   EnableIdleShutdown:
@@ -360,7 +414,11 @@ Conditions:
   HasDnsName: !Not [!Equals [!Ref DnsName, ""]]
   AllowSsh: !Not [!Equals [!Ref AllowedCidr, ""]]
   AttachOllamaClientSg: !Not [!Equals [!Ref OllamaClientSecurityGroupId, ""]]
-  IdleShutdownEnabled: !Equals [!Ref EnableIdleShutdown, "true"]
+  CreateServer: !Equals [!Ref ServerEnabled, "true"]
+  HasWorkspaceSnapshot: !Not [!Equals [!Ref WorkspaceSnapshotId, ""]]
+  IdleShutdownEnabled: !And
+    - !Equals [!Ref EnableIdleShutdown, "true"]
+    - !Condition CreateServer
   PlaywrightEnabled: !Equals [!Ref EnablePlaywright, "true"]
   UsesGitHub: !Equals [!Ref SourceProvider, GitHub]
   UsesAzureDevOps: !Equals [!Ref SourceProvider, AzureDevOps]
@@ -393,8 +451,43 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-sg"
 
+  # Code, package caches and the VS Code server, kept across server rebuilds.
+  # The environment stack's workspace document attaches it (CloudFormation
+  # cannot: it would try before a replaced instance lets go of the volume),
+  # formats it only when blank and mounts it at /workspace. Snapshotted when
+  # the stack is deleted or the volume is replaced.
+  # The subnet's Availability Zone, looked up by the environment stack's
+  # subnet lookup function (CloudFormation cannot read it from a subnet ID).
+  SubnetInfo:
+    Type: Custom::SubnetInfo
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub "${EnvironmentStackName}-SubnetLookupFunctionArn"
+      SubnetId: !Ref SubnetId
+
+  WorkspaceVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !GetAtt SubnetInfo.AvailabilityZone
+      Size: !Ref WorkspaceVolumeSize
+      SnapshotId: !If [HasWorkspaceSnapshot, !Ref WorkspaceSnapshotId, !Ref AWS::NoValue]
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-workspace"
+        # Lets this environment's dev server role attach it.
+        - Key: CloudDevEnvironment
+          Value: !Ref EnvironmentStackName
+        # Selects it for the environment stack's optional daily snapshots.
+        - Key: CloudDevWorkspace
+          Value: !Ref EnvironmentStackName
+
   DevServerInstance:
     Type: AWS::EC2::Instance
+    Condition: CreateServer
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref InstanceType
@@ -472,6 +565,12 @@ Resources:
           - Key: CloudDevGitUserEmail
             Value: !Ref GitUserEmail
           - !Ref AWS::NoValue
+        # Workspace volume: the environment stack's workspace association
+        # attaches the volume named here and mounts it at /workspace.
+        - Key: CloudDevWorkspaceConfig
+          Value: enabled
+        - Key: CloudDevWorkspaceVolumeId
+          Value: !Ref WorkspaceVolume
       UserData:
         Fn::Base64:
           Fn::Sub:
@@ -785,8 +884,15 @@ Resources:
 # ---------------------------------------------------------------------------
 Outputs:
   InstanceId:
+    Condition: CreateServer
     Description: ID of the dev server EC2 instance.
     Value: !Ref DevServerInstance
+
+  WorkspaceVolumeId:
+    Description: >-
+      ID of the workspace EBS volume (mounted at /workspace), kept when the
+      server is rebuilt.
+    Value: !Ref WorkspaceVolume
 
   # No public IP / DNS / SSH outputs: the public IP is ephemeral (it changes on
   # every stop/start, which the idle auto-stop alarm triggers), so outputting it
@@ -794,6 +900,7 @@ Outputs:
   # Connect via Session Manager instead, which targets the stable instance ID,
   # needs no open SSH port, and uses the attached SSM role.
   SessionManagerCommand:
+    Condition: CreateServer
     Description: >-
       Connect to the dev server via AWS Systems Manager Session Manager
       (no SSH key or open port required).
