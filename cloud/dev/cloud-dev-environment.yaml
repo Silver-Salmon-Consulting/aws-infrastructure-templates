@@ -753,18 +753,27 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 # SSM runs commands as root but does NOT set HOME; nvm needs it
                 # and under 'set -u' an unbound HOME aborts the script. Export it.
                 - export HOME=/root
-                - dnf install -y git tar gzip gcc-c++ make
+                - retry dnf install -y git tar gzip gcc-c++ make
                 - export NVM_DIR=/opt/nvm
                 - mkdir -p "$NVM_DIR"
-                - curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | NVM_DIR="$NVM_DIR" bash
+                # nvm itself only on the first run.
+                - |
+                  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+                    retry curl -sSfL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh -o /tmp/nvm-install.sh
+                    NVM_DIR="$NVM_DIR" bash /tmp/nvm-install.sh
+                  fi
                 - . "$NVM_DIR/nvm.sh"
-                - nvm install "{{NodeVersion}}"
+                - retry nvm install "{{NodeVersion}}"
                 - nvm alias default "{{NodeVersion}}"
                 - nvm use default
-                - npm install -g "npm@{{NpmVersion}}"
+                - '[ "$(npm -v)" = "{{NpmVersion}}" ] || retry npm install -g "npm@{{NpmVersion}}"'
                 - printf 'export NVM_DIR="/opt/nvm"\n[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\n' > /etc/profile.d/nvm.sh
                 - chmod +x /etc/profile.d/nvm.sh
                 - chown -R ec2-user:ec2-user /opt/nvm
@@ -801,6 +810,10 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - PS_VERSION="{{PowerShellVersion}}"
                 - |
                   case "$(uname -m)" in
@@ -808,7 +821,12 @@ Resources:
                     aarch64) PS_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y tar gzip libicu
+                # Nothing to do when this release is already installed.
+                - |
+                  if [ "$(/usr/bin/pwsh --version 2>/dev/null)" = "PowerShell $PS_VERSION" ]; then
+                    echo "PowerShell $PS_VERSION is already installed."; exit 0
+                  fi
+                - retry dnf install -y tar gzip libicu
                 - INSTALL_DIR="/opt/microsoft/powershell/7"
                 # Replace any previously installed release so switching
                 # versions leaves exactly one pwsh.
@@ -816,7 +834,7 @@ Resources:
                 - mkdir -p "$INSTALL_DIR"
                 - TARBALL="/tmp/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
                 - URL="https://github.com/PowerShell/PowerShell/releases/download/v$PS_VERSION/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
-                - curl -sSfL "$URL" -o "$TARBALL"
+                - retry curl -sSfL "$URL" -o "$TARBALL"
                 - tar -xzf "$TARBALL" -C "$INSTALL_DIR"
                 - chmod +x "$INSTALL_DIR/pwsh"
                 - ln -sf "$INSTALL_DIR/pwsh" /usr/bin/pwsh
@@ -848,6 +866,10 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - PS_VERSION="{{PowerShellVersion}}"
                 - |
                   case "$(uname -m)" in
@@ -855,7 +877,12 @@ Resources:
                     aarch64) PS_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y tar gzip libicu
+                # Nothing to do when this release is already installed.
+                - |
+                  if [ "$(/usr/bin/pwsh --version 2>/dev/null)" = "PowerShell $PS_VERSION" ]; then
+                    echo "PowerShell $PS_VERSION is already installed."; exit 0
+                  fi
+                - retry dnf install -y tar gzip libicu
                 - INSTALL_DIR="/opt/microsoft/powershell/7"
                 # Replace any previously installed release so switching
                 # versions leaves exactly one pwsh.
@@ -863,7 +890,7 @@ Resources:
                 - mkdir -p "$INSTALL_DIR"
                 - TARBALL="/tmp/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
                 - URL="https://github.com/PowerShell/PowerShell/releases/download/v$PS_VERSION/powershell-$PS_VERSION-linux-$PS_ARCH.tar.gz"
-                - curl -sSfL "$URL" -o "$TARBALL"
+                - retry curl -sSfL "$URL" -o "$TARBALL"
                 - tar -xzf "$TARBALL" -C "$INSTALL_DIR"
                 - chmod +x "$INSTALL_DIR/pwsh"
                 - ln -sf "$INSTALL_DIR/pwsh" /usr/bin/pwsh
@@ -904,6 +931,10 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 # Playwright needs Node (installed by the Node config
                 # document). That association runs at the same time as this
                 # one at first boot, so wait for Node (up to 15 minutes)
@@ -920,7 +951,7 @@ Resources:
                 # Shared libraries Chromium links against. Installed strictly
                 # so a missing package fails the association visibly.
                 - >-
-                  dnf install -y
+                  retry dnf install -y
                   nss nspr atk at-spi2-atk at-spi2-core cups-libs dbus-libs
                   expat glib2 libdrm libxkbcommon mesa-libgbm alsa-lib
                   pango cairo libX11 libxcb libXcomposite libXcursor
@@ -929,7 +960,7 @@ Resources:
                 # Fonts are best-effort (strict=0 skips any package name this
                 # AL2023 release does not carry) so text renders in screenshots.
                 - >-
-                  dnf install -y --setopt=strict=0
+                  retry dnf install -y --setopt=strict=0
                   dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts
                   liberation-fonts google-noto-sans-fonts
                   google-noto-emoji-color-fonts
@@ -938,7 +969,8 @@ Resources:
                 # every user via PLAYWRIGHT_BROWSERS_PATH.
                 - export PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
                 - mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
-                - npx --yes "playwright@{{PlaywrightVersion}}" install chromium
+                # A no-op when this Chromium build is already installed.
+                - retry npx --yes "playwright@{{PlaywrightVersion}}" install chromium
                 - chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
                 - printf 'export PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers\n' > /etc/profile.d/playwright.sh
                 - chmod +x /etc/profile.d/playwright.sh
@@ -977,13 +1009,18 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 # dotnet-install.sh resolves paths from HOME; SSM leaves it unset.
                 - export HOME=/root
-                - dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++
+                - retry dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++
                 - INSTALL_DIR=/opt/dotnet
                 - mkdir -p "$INSTALL_DIR"
-                - curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-                - bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path
+                - retry curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+                # Skips the download when this SDK is already installed.
+                - retry bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path
                 - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
                 - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
                 - chmod +x /etc/profile.d/dotnet.sh
@@ -1015,13 +1052,18 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 # dotnet-install.sh resolves paths from HOME; SSM leaves it unset.
                 - export HOME=/root
-                - dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++
+                - retry dnf install -y tar gzip libicu krb5-libs openssl-libs zlib libstdc++
                 - INSTALL_DIR=/opt/dotnet
                 - mkdir -p "$INSTALL_DIR"
-                - curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-                - bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path
+                - retry curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+                # Skips the download when this SDK is already installed.
+                - retry bash /tmp/dotnet-install.sh --version "{{DotNetVersion}}" --install-dir "$INSTALL_DIR" --no-path
                 - ln -sf "$INSTALL_DIR/dotnet" /usr/bin/dotnet
                 - printf 'export DOTNET_ROOT=/opt/dotnet\nexport DOTNET_CLI_TELEMETRY_OPTOUT=1\nexport PATH="$PATH:$HOME/.dotnet/tools"\n' > /etc/profile.d/dotnet.sh
                 - chmod +x /etc/profile.d/dotnet.sh
@@ -1047,7 +1089,11 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
-                - dnf install -y jq zip unzip
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
+                - retry dnf install -y jq zip unzip
                 - jq --version
 
   # Versioned tool documents: ONE DOCUMENT PER TOOL PER MAJOR VERSION. The
@@ -1085,6 +1131,10 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - K6_VERSION="{{K6Version}}"
                 - |
                   case "$(uname -m)" in
@@ -1092,9 +1142,15 @@ Resources:
                     aarch64) K6_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y tar gzip
+                # Nothing to do when this version is already installed.
+                - |
+                  if /usr/local/bin/k6 version 2>/dev/null | grep -q "^k6 v$K6_VERSION "; then
+                    echo "k6 $K6_VERSION is already installed."; exit 0
+                  fi
+                - retry dnf install -y tar gzip
                 - TMP_DIR=$(mktemp -d)
-                - curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" | tar -xz -C "$TMP_DIR"
+                - retry curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" -o "$TMP_DIR/k6.tar.gz"
+                - tar -xzf "$TMP_DIR/k6.tar.gz" -C "$TMP_DIR"
                 - install -m 0755 "$TMP_DIR/k6-v$K6_VERSION-linux-$K6_ARCH/k6" /usr/local/bin/k6
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/k6 version
@@ -1124,6 +1180,10 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - K6_VERSION="{{K6Version}}"
                 - |
                   case "$(uname -m)" in
@@ -1131,9 +1191,15 @@ Resources:
                     aarch64) K6_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y tar gzip
+                # Nothing to do when this version is already installed.
+                - |
+                  if /usr/local/bin/k6 version 2>/dev/null | grep -q "^k6 v$K6_VERSION "; then
+                    echo "k6 $K6_VERSION is already installed."; exit 0
+                  fi
+                - retry dnf install -y tar gzip
                 - TMP_DIR=$(mktemp -d)
-                - curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" | tar -xz -C "$TMP_DIR"
+                - retry curl -sSfL "https://github.com/grafana/k6/releases/download/v$K6_VERSION/k6-v$K6_VERSION-linux-$K6_ARCH.tar.gz" -o "$TMP_DIR/k6.tar.gz"
+                - tar -xzf "$TMP_DIR/k6.tar.gz" -C "$TMP_DIR"
                 - install -m 0755 "$TMP_DIR/k6-v$K6_VERSION-linux-$K6_ARCH/k6" /usr/local/bin/k6
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/k6 version
@@ -1169,20 +1235,16 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - AWSCLI_VERSION="{{AwsCliVersion}}"
                 - |
                   case "$(uname -m)" in
                     x86_64|aarch64) AWSCLI_ARCH="$(uname -m)" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y unzip
-                - ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH-$AWSCLI_VERSION.zip"
-                - TMP_DIR=$(mktemp -d)
-                - curl -sSfL "https://awscli.amazonaws.com/$ZIP_NAME" -o "$TMP_DIR/awscliv2.zip"
-                - unzip -q "$TMP_DIR/awscliv2.zip" -d "$TMP_DIR"
-                - '"$TMP_DIR/aws/install" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin --update'
-                - rm -rf "$TMP_DIR"
-                - /usr/local/bin/aws --version
                 # Start ec2-user with an empty ~/.aws/credentials so it is
                 # ready to fill in. Never overwrite an existing file, so
                 # re-runs keep any credentials already added. With no profile
@@ -1192,6 +1254,19 @@ Resources:
                 - chown -R ec2-user:ec2-user /home/ec2-user/.aws
                 - chmod 700 /home/ec2-user/.aws
                 - chmod 600 /home/ec2-user/.aws/credentials
+                # Nothing more to do when this version is already installed.
+                - |
+                  if /usr/local/bin/aws --version 2>/dev/null | grep -q "^aws-cli/$AWSCLI_VERSION "; then
+                    echo "AWS CLI $AWSCLI_VERSION is already installed."; exit 0
+                  fi
+                - retry dnf install -y unzip
+                - ZIP_NAME="awscli-exe-linux-$AWSCLI_ARCH-$AWSCLI_VERSION.zip"
+                - TMP_DIR=$(mktemp -d)
+                - retry curl -sSfL "https://awscli.amazonaws.com/$ZIP_NAME" -o "$TMP_DIR/awscliv2.zip"
+                - unzip -q "$TMP_DIR/awscliv2.zip" -d "$TMP_DIR"
+                - '"$TMP_DIR/aws/install" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin --update'
+                - rm -rf "$TMP_DIR"
+                - /usr/local/bin/aws --version
 
   # GitHub CLI 2.x from GitHub's release tarball (amd64/arm64 picked from
   # uname) into /usr/local/bin/gh, pinned by GhCliVersion. Applied to servers
@@ -1225,6 +1300,10 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - GH_VERSION="{{GhCliVersion}}"
                 - |
                   case "$(uname -m)" in
@@ -1232,9 +1311,15 @@ Resources:
                     aarch64) GH_ARCH="arm64" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - dnf install -y tar gzip
+                # Nothing to do when this version is already installed.
+                - |
+                  if /usr/local/bin/gh --version 2>/dev/null | grep -q "^gh version $GH_VERSION "; then
+                    echo "GitHub CLI $GH_VERSION is already installed."; exit 0
+                  fi
+                - retry dnf install -y tar gzip
                 - TMP_DIR=$(mktemp -d)
-                - curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" | tar -xz -C "$TMP_DIR"
+                - retry curl -sSfL "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" -o "$TMP_DIR/gh.tar.gz"
+                - tar -xzf "$TMP_DIR/gh.tar.gz" -C "$TMP_DIR"
                 - install -m 0755 "$TMP_DIR/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
                 - rm -rf "$TMP_DIR"
                 - /usr/local/bin/gh --version
@@ -1274,19 +1359,27 @@ Resources:
             inputs:
               runCommand:
                 - set -euxo pipefail
+                # Retry network and dnf steps (5 tries, 20s apart): every install
+                # association starts at once on a new server, and a dnf clash or a
+                # download blip used to fail one for good.
+                - 'retry() { local n=1; until "$@"; do [ "$n" -ge 5 ] && return 1; echo "Attempt $n failed: $*; retrying in 20s" >&2; n=$((n + 1)); sleep 20; done; }'
                 - AZ_VERSION="{{AzCliVersion}}"
                 - |
                   case "$(uname -m)" in
                     x86_64|aarch64) AZ_ARCH="$(uname -m)" ;;
                     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
                   esac
-                - rpm --import https://packages.microsoft.com/keys/microsoft.asc
+                - retry rpm --import https://packages.microsoft.com/keys/microsoft.asc
                 - AZ_RPM="https://packages.microsoft.com/rhel/9.0/prod/Packages/a/azure-cli-$AZ_VERSION-1.el9.$AZ_ARCH.rpm"
-                # install covers a first install and an upgrade; downgrade
-                # covers pinning an older release.
-                - dnf install -y --setopt=localpkg_gpgcheck=1 "$AZ_RPM" || dnf downgrade -y --setopt=localpkg_gpgcheck=1 "$AZ_RPM"
+                # Only when this version is not installed yet: install covers a
+                # first install and an upgrade; downgrade covers pinning an older
+                # release.
+                - |
+                  if [ "$(rpm -q --qf '%{VERSION}' azure-cli 2>/dev/null)" != "$AZ_VERSION" ]; then
+                    retry dnf install -y --setopt=localpkg_gpgcheck=1 "$AZ_RPM" || retry dnf downgrade -y --setopt=localpkg_gpgcheck=1 "$AZ_RPM"
+                  fi
                 - sudo -u ec2-user -H az config set core.collect_telemetry=false --only-show-errors
-                - sudo -u ec2-user -H az extension add --name azure-devops --upgrade --yes --only-show-errors
+                - retry sudo -u ec2-user -H az extension add --name azure-devops --upgrade --yes --only-show-errors
                 - sudo -u ec2-user -H az version
 
   # Source control document: provider-neutral Git setup for dev servers,
@@ -1861,14 +1954,17 @@ Resources:
   # this stack beside the document and references it with !Ref (NO
   # Fn::ImportValue), so editing the document no longer hits a cross-stack
   # export lock. No Parameters: the document's own NodeVersion/NpmVersion
-  # defaults (fleet-wide, from this stack's params) govern. Launch-only
-  # (no ScheduleExpression); applies when a matching instance registers with
-  # SSM. Decouple a server by removing its CloudDevNodeConfig tag.
+  # defaults (fleet-wide, from this stack's params) govern. Runs when a
+  # matching instance registers with SSM and again daily, like every install
+  # association: the daily run repairs an install that failed (the documents
+  # retry, then skip work already done) and rolls out a changed version.
+  # Decouple a server by removing its CloudDevNodeConfig tag.
   NodeConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: !Sub "${AWS::StackName}-node-config"
       Name: !Ref AmazonLinuxServerConfigDocument
+      ScheduleExpression: rate(1 day)
       Targets:
         - Key: "tag:CloudDevNodeConfig"
           Values:
@@ -1878,13 +1974,14 @@ Resources:
   # k6 below): each tool has ONE tag key and the tag VALUE selects the
   # document, so a server matches at most one association per tool. Each
   # passes its exact version from the matching environment stack parameter
-  # (the documents have no defaults). Launch-only; a server opts out with a
-  # value that matches nothing ("none").
+  # (the documents have no defaults). At launch and daily; a server opts out
+  # with a value that matches nothing ("none").
   PowerShellV74ConfigAssociation:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: !Sub "${AWS::StackName}-powershell-v74"
       Name: !Ref AmazonLinuxPowerShellV74Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         PowerShellVersion:
           - !Ref PowerShell74Version
@@ -1898,6 +1995,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-powershell-v76"
       Name: !Ref AmazonLinuxPowerShellV76Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         PowerShellVersion:
           - !Ref PowerShell76Version
@@ -1915,6 +2013,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-playwright"
       Name: !Ref AmazonLinuxPlaywrightDocument
+      ScheduleExpression: rate(1 day)
       Parameters:
         PlaywrightVersion:
           - !Ref PlaywrightVersion
@@ -1928,6 +2027,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-dotnet8"
       Name: !Ref AmazonLinuxDotNet8SdkDocument
+      ScheduleExpression: rate(1 day)
       Parameters:
         DotNetVersion:
           - !Ref DotNet8Version
@@ -1941,6 +2041,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-dotnet10"
       Name: !Ref AmazonLinuxDotNet10SdkDocument
+      ScheduleExpression: rate(1 day)
       Parameters:
         DotNetVersion:
           - !Ref DotNet10Version
@@ -1956,6 +2057,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-base-tools"
       Name: !Ref AmazonLinuxBaseToolsDocument
+      ScheduleExpression: rate(1 day)
       Targets:
         - Key: "tag:CloudDevBaseToolsConfig"
           Values:
@@ -1970,6 +2072,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-k6-v0"
       Name: !Ref AmazonLinuxK6V0Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         K6Version:
           - !Ref K6V0Version
@@ -1983,6 +2086,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-k6-v1"
       Name: !Ref AmazonLinuxK6V1Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         K6Version:
           - !Ref K6V1Version
@@ -1996,6 +2100,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-awscli-v2"
       Name: !Ref AmazonLinuxAwsCliV2Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         AwsCliVersion:
           - !Ref AwsCliV2Version
@@ -2009,6 +2114,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-ghcli-v2"
       Name: !Ref AmazonLinuxGhCliV2Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         GhCliVersion:
           - !Ref GhCliV2Version
@@ -2022,6 +2128,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-azcli-v2"
       Name: !Ref AmazonLinuxAzCliV2Document
+      ScheduleExpression: rate(1 day)
       Parameters:
         AzCliVersion:
           - !Ref AzCliV2Version
@@ -2037,6 +2144,7 @@ Resources:
     Properties:
       AssociationName: !Sub "${AWS::StackName}-source-control"
       Name: !Ref AmazonLinuxSourceControlDocument
+      ScheduleExpression: rate(1 day)
       Parameters:
         Action:
           - Setup

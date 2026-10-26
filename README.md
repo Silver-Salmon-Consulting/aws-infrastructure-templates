@@ -240,7 +240,14 @@ Node.js and PowerShell are **not** installed by instance UserData. Instead:
    - `SourceControlConfigAssociation` targets `tag:CloudDevSourceProvider = GitHub`
      or `AzureDevOps` (see [Source control](#source-control-github-or-azure-devops))
    - `WorkspaceConfigAssociation` targets `tag:CloudDevWorkspaceConfig = enabled`
-     and, unlike the others, re-runs every 30 minutes (see [Workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds))
+     and re-runs every 30 minutes (see [Workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds))
+
+   The other associations run when a server first registers with SSM and then
+   **once a day**. A new server starts all of them at once, so each document
+   retries its downloads and `dnf` steps (5 tries, 20 seconds apart), and the
+   daily run installs anything that still failed. A daily run skips work that
+   is already done, so it is quick and downloads nothing when versions are
+   current. Playwright also waits up to 15 minutes for the Node install.
 3. Each server tags its instance to opt in:
    - `CloudDevNodeConfig = enabled` (always — every dev server gets Node)
    - `CloudDevPowerShellConfig = <PowerShellVersion>` (`none` / `v7.4` / `v7.6`,
@@ -296,8 +303,9 @@ from a pinned environment-stack parameter (`PowerShell74Version`,
 - To add a major, copy the document and association, change the major number,
   and add the value to the server stacks' `AllowedValues`.
 - To roll the fleet to a new release, change the pinned parameter on the
-  environment stack and re-apply the association. Changing a server's tag value
-  and re-applying switches majors.
+  environment stack. Every server installs it within a day; re-apply the
+  association to do it now. Changing a server's tag value switches majors the
+  same way.
 
 To pin an exact version on one server, run the document with Run Command:
 
@@ -351,8 +359,8 @@ Servers only choose *which* line to install (`PowerShellVersion`,
 release is fleet-wide.
 
 Server stacks do not take an exact version. Changing the fleet version means
-updating the environment stack and re-applying the association on existing
-servers (new servers pick it up automatically).
+updating the environment stack; existing servers pick it up within a day (or
+re-apply the association to do it now), and new servers right away.
 
 ### Source control: GitHub or Azure DevOps
 
@@ -392,8 +400,8 @@ Three documents do this:
 Changing `SourceProvider` on an existing server switches which CLI the
 associations target; the other CLI stays installed until you remove it.
 
-Changing `GitUserName` / `GitUserEmail` on an existing server updates its tags
-only; the association does not re-run on a tag change. Apply it with **Systems
+Changing `GitUserName` / `GitUserEmail` on an existing server updates its tags;
+the daily source control run applies them. To apply them now, use **Systems
 Manager > State Manager > `<env>-source-control` > Apply association now**, or
 run `git config --global` yourself. Clearing a value leaves the old setting in
 place.
@@ -622,7 +630,10 @@ create with the instance still running, deploy with `--disable-rollback`.
 The instance reaches `CREATE_COMPLETE` once it boots and signals — **before**
 Node/PowerShell finish installing. Those install asynchronously via SSM State
 Manager after the instance registers; check their status in SSM association
-compliance (or just connect and run `node --version` / `pwsh --version`).
+compliance (or just connect and run `node --version` / `pwsh --version`). An
+install that fails is retried by the next daily run; to retry it now, run
+`aws ssm start-associations-once --association-ids <id>` for that association
+(the CloudDev permission set allows it).
 
 ### 3. (Optional) Deploy the developer permission set
 
