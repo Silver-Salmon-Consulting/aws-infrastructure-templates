@@ -60,9 +60,11 @@ Then give the developer:
 ##### Rebuilding a server
 
 Update the stack with `ServerEnabled=false`, then again with
-`ServerEnabled=true`. The developer's code is on the stack's
+`ServerEnabled=true`. The developer's whole home folder (code, Git keys,
+logins, settings) is on the stack's
 [workspace disk](#workspace-disk-code-and-caches-that-survive-rebuilds), so
-nothing in `~/code` is lost. The new server has a new `InstanceId`.
+the rebuilt server picks up where the old one left off. Only the OS is new, and
+the server gets a new `InstanceId`. A **new stack** starts with a fresh home.
 
 #### Developer setup
 
@@ -153,9 +155,8 @@ server:
 the previous key for rollback and lists any older ones it removed, which you
 then delete in GitHub. More options: [Rotating the SSH key](#rotating-the-ssh-key).
 
-**After a rebuild:** the key is on the server's root disk, not the workspace,
-so a rebuilt server needs `rotate-git-key` again (delete the old server's key
-in GitHub).
+**After a rebuild:** nothing to do. The key is in your home folder on the
+workspace disk, so a rebuilt server keeps it. A new stack needs its own key.
 
 **Alternative: use your own key instead.** With `ForwardAgent yes` in your SSH
 config, git on the server can use the key on your own machine while you are
@@ -741,8 +742,11 @@ Each server stack owns two disks:
 
 | Disk | Holds | Lifetime |
 | --- | --- | --- |
-| Root (`VolumeSize`, default 30 GiB) | OS, installed tools, SSH and git keys, `~/.aws` and other credentials | Replaced with the server; never shared |
-| Workspace (`WorkspaceVolumeSize`, default 20 GiB), at `/workspace` | `~/code`, the npm / NuGet / pip caches, `~/.vscode-server` | Belongs to the stack; kept when the server is rebuilt |
+| Root (`VolumeSize`, default 30 GiB) | The OS and the tools the SSM documents install (`/usr`, `/opt`, `/etc`) | Replaced with the server, then rebuilt by SSM |
+| Workspace (`WorkspaceVolumeSize`, default 20 GiB), at `/workspace` | All of `/home/ec2-user`: `~/code`, Git SSH keys, `~/.aws`, `gh`/`az` logins, `~/.gitconfig`, shell history and dotfiles, `~/.vscode-server`; plus the npm / NuGet / pip caches and `packages.txt` | Belongs to the stack; kept when the server is rebuilt. A new stack starts empty |
+
+So an AMI update or rebuild keeps your keys, logins and settings, and only a
+new stack needs them set up again.
 
 The stack creates the workspace volume and tags the instance with its ID. The
 environment stack's `AmazonLinuxWorkspaceDocument` (run by
@@ -753,11 +757,27 @@ environment stack's `AmazonLinuxWorkspaceDocument` (run by
    attach it itself, because it creates the new server before deleting the old;
 2. formats it **only** if it has no file system, and mounts it at `/workspace`
    (by UUID in `/etc/fstab`, with `nofail`);
-3. links `~/code` and `~/.vscode-server` into it and sets `npm_config_cache`,
-   `NUGET_PACKAGES` and `PIP_CACHE_DIR` in `/etc/profile.d/clouddev-workspace.sh`.
+3. bind-mounts `/workspace/home` over `/home/ec2-user`. The first time, the
+   server's current home is copied in. On a later server it keeps the
+   workspace's home, taking only the new server's `~/.ssh/authorized_keys` (so
+   a changed `KeyPairName` still works), and re-applies the stack's git name
+   and email. Sessions opened in the first minutes, before the move, should
+   reconnect;
+4. links `~/code` and `~/.vscode-server` into it and sets `npm_config_cache`,
+   `NUGET_PACKAGES` and `PIP_CACHE_DIR` in `/etc/profile.d/clouddev-workspace.sh`;
+5. installs any missing packages listed in `/workspace/packages.txt`.
 
 It re-runs every 30 minutes; each run is a no-op unless something changed, and
 it grows the file system after `WorkspaceVolumeSize` is raised.
+
+**Extra packages:** anything you install by hand with `dnf` is on the root disk
+and is lost when the server is replaced. List it in `/workspace/packages.txt`
+instead, one per line (`#` for comments). New servers install it, and a package
+you add is installed within 30 minutes:
+
+```bash
+echo htop >> /workspace/packages.txt
+```
 
 What happens to the workspace when you change the stack:
 
@@ -779,15 +799,23 @@ workspace volume daily at 05:00 UTC and keeps the newest
 `WorkspaceSnapshotRetain` (default 7). Snapshots cannot skip folders, so the
 caches are backed up too.
 
-The dev server role can attach any volume tagged with its environment to any of
-the environment's servers (all servers share the role), so workspaces are
-separated by stack, not enforced between users.
+**Security:** because the home is on the workspace, Git keys and CLI logins
+outlive the server and are in the workspace's snapshots (encrypted). Anyone in
+the account who can create a volume from those snapshots can read them. The dev
+server role can also attach any unattached volume tagged with its environment
+(e.g. a parked project's) to any of the environment's servers, because all
+servers share the role. Workspaces are separated by stack, not enforced between
+users, so:
 
-**Existing servers:** updating a server stack from these templates adds an empty
-workspace and links `~/code` to it; existing folders such as `~/github` stay on
-the root disk. Move what you want to keep into `~/code`, because the root disk
-is lost the next time the server is replaced (e.g. by an AMI update, which any
-stack update can pick up).
+- do not keep long-lived AWS access keys in `~/.aws` (the server uses its
+  instance role, and you sign in with SSO);
+- revoke a project's Git keys in GitHub / Azure DevOps when its stack is
+  deleted.
+
+**Existing servers:** updating a server stack from these templates adds a
+workspace and copies the server's current home onto it, so nothing in the home
+folder is lost. Code in `~/github` comes along; move it into `~/code` if you
+like.
 
 ## Idle auto-stop safeguard
 

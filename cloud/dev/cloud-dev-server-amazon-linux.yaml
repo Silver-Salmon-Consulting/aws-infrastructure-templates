@@ -197,9 +197,9 @@ Parameters:
   VolumeSize:
     Type: Number
     Description: >-
-      Root EBS volume size in GiB: the OS, installed tools, SSH keys and
-      credentials. It is replaced with the server; code and caches live on the
-      workspace volume instead.
+      Root EBS volume size in GiB: the OS and the tools the SSM documents
+      install. It is replaced with the server; ec2-user's home (code, keys,
+      logins, settings) lives on the workspace volume instead.
     Default: 30
     MinValue: 8
     MaxValue: 1000
@@ -231,9 +231,10 @@ Parameters:
   WorkspaceVolumeSize:
     Type: Number
     Description: >-
-      Workspace volume size in GiB, mounted at /workspace (~/code, package
-      caches, VS Code server). Can be increased later without a rebuild (the
-      file system grows within 30 minutes); EBS volumes cannot shrink.
+      Workspace volume size in GiB, mounted at /workspace: all of ec2-user's
+      home (~/code, Git keys, logins, settings, VS Code server) and the package
+      caches. Can be increased later without a rebuild (the file system grows
+      within 30 minutes); EBS volumes cannot shrink.
     Default: 20
     MinValue: 1
     MaxValue: 1000
@@ -451,7 +452,8 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-sg"
 
-  # Code, package caches and the VS Code server, kept across server rebuilds.
+  # ec2-user's home (code, keys, logins, settings) and package caches, kept
+  # across server rebuilds and AMI updates.
   # The environment stack's workspace document attaches it (CloudFormation
   # cannot: it would try before a replaced instance lets go of the volume),
   # formats it only when blank and mounts it at /workspace. Snapshotted when

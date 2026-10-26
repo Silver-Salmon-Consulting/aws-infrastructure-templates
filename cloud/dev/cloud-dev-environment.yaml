@@ -1581,11 +1581,13 @@ Resources:
                   fi
 
   # Workspace disk: each server stack owns a separate EBS volume that outlives
-  # the server (rebuilds, AMI updates, ServerEnabled=false) and holds code,
-  # package caches and the VS Code server. The stack tags the instance with
-  # the volume ID (CloudDevWorkspaceVolumeId); this document attaches that
-  # volume, formats it only if it has no file system, mounts it at /workspace
-  # and links ~/code and ~/.vscode-server into it. The ATTACH is done here, not
+  # the server (rebuilds, AMI updates, ServerEnabled=false) and holds ec2-user's
+  # whole home (keys, logins, settings), code, package caches and the VS Code
+  # server. The stack tags the instance with the volume ID
+  # (CloudDevWorkspaceVolumeId); this document attaches that volume, formats it
+  # only if it has no file system, mounts it at /workspace, bind-mounts
+  # /workspace/home over /home/ec2-user, links ~/code and ~/.vscode-server into
+  # it and installs the packages in /workspace/packages.txt. The ATTACH is done here, not
   # by CloudFormation, because CloudFormation creates a replacement instance
   # before deleting the old one, so a stack-managed attachment would fail while
   # the old instance still holds the volume. This waits for the old instance
@@ -1602,8 +1604,10 @@ Resources:
         description: >-
           Attach this server's workspace EBS volume (from its
           CloudDevWorkspaceVolumeId tag), format it if blank, mount it at
-          /workspace, grow the file system to the volume size, and point
-          ~/code, ~/.vscode-server and the npm / NuGet / pip caches at it.
+          /workspace, grow the file system to the volume size, move
+          ec2-user's home onto it, point ~/code, ~/.vscode-server and the npm /
+          NuGet / pip caches at it, and install the packages listed in
+          /workspace/packages.txt.
         mainSteps:
           - action: aws:runShellScript
             name: workspace
@@ -1665,10 +1669,14 @@ Resources:
                   fi
                   UUID=$(blkid -s UUID -o value "$DEV")
 
-                  # Mount by UUID; nofail so the server still boots without it.
+                  # Mount by UUID; nofail so the server still boots without it. All of
+                  # ec2-user's home is bind-mounted from /workspace/home, so keys,
+                  # logins and settings survive rebuilds and AMI updates; a new stack
+                  # starts with a fresh home.
                   mkdir -p /workspace
-                  sed -i '\# /workspace #d' /etc/fstab
+                  sed -i -e '\# /workspace #d' -e '\# /home/ec2-user #d' /etc/fstab
                   echo "UUID=$UUID /workspace xfs defaults,nofail 0 2" >> /etc/fstab
+                  echo "/workspace/home /home/ec2-user none bind,nofail,x-systemd.requires-mounts-for=/workspace 0 0" >> /etc/fstab
                   systemctl daemon-reload
                   mountpoint -q /workspace || mount /workspace
                   # Extend the file system after the stack grows the volume (no-op otherwise).
@@ -1676,6 +1684,65 @@ Resources:
 
                   install -d -o ec2-user -g ec2-user /workspace/code /workspace/vscode-server \
                     /workspace/cache /workspace/cache/npm /workspace/cache/nuget /workspace/cache/pip
+
+                  # Move the home onto the workspace. The first time, the server's
+                  # current home is copied in. On a later instance (rebuild, AMI
+                  # update) the workspace's home is kept and only this server's
+                  # authorized_keys (the stack's key pair, written at first boot) is
+                  # taken, so a changed KeyPairName still logs in.
+                  HOME_MOVED=0
+                  if ! mountpoint -q /home/ec2-user; then
+                    if [ ! -d /workspace/home ]; then
+                      echo "Copying /home/ec2-user to the workspace..."
+                      mkdir /workspace/home
+                      cp -a /home/ec2-user/. /workspace/home/
+                    elif [ -f /home/ec2-user/.ssh/authorized_keys ]; then
+                      install -d -m 700 -o ec2-user -g ec2-user /workspace/home/.ssh
+                      install -m 600 -o ec2-user -g ec2-user /home/ec2-user/.ssh/authorized_keys /workspace/home/.ssh/authorized_keys
+                    fi
+                    chown ec2-user:ec2-user /workspace/home
+                    chmod 700 /workspace/home
+                    mount /home/ec2-user
+                    HOME_MOVED=1
+                    echo "ec2-user's home is now on the workspace; reconnect sessions opened before this."
+                  fi
+
+                  # The source control document may have set the git identity in the
+                  # old home before the move; apply the stack's values again.
+                  if [ "$HOME_MOVED" = 1 ]; then
+                    TAGS=$(aws ec2 describe-tags --region "$REGION" --filters "Name=resource-id,Values=$INSTANCE_ID" \
+                      --query 'Tags[].[Key,Value]' --output text)
+                    tag() { printf '%s\n' "$TAGS" | awk -F'\t' -v k="$1" '$1==k{print $2}'; }
+                    GIT_NAME=$(tag CloudDevGitUserName)
+                    GIT_EMAIL=$(tag CloudDevGitUserEmail)
+                    if [ -n "$GIT_NAME$GIT_EMAIL" ] && command -v git > /dev/null; then
+                      [ -z "$GIT_NAME" ] || sudo -u ec2-user -H git config --global user.name "$GIT_NAME"
+                      [ -z "$GIT_EMAIL" ] || sudo -u ec2-user -H git config --global user.email "$GIT_EMAIL"
+                    fi
+                  fi
+
+                  # Extra dnf packages the developer lists in /workspace/packages.txt
+                  # (one per line, # for comments), reinstalled on every new server.
+                  # ec2-user can already sudo, so this grants nothing new.
+                  PKG_FILE=/workspace/packages.txt
+                  if [ ! -e "$PKG_FILE" ]; then
+                    printf '%s\n' "# Extra dnf packages for this server, one per line (e.g. htop)." \
+                      "# Installed on every new server and within 30 minutes of being added." > "$PKG_FILE"
+                    chown ec2-user:ec2-user "$PKG_FILE"
+                  fi
+                  MISSING=()
+                  while read -r PKG _; do
+                    case "$PKG" in ""|"#"*) continue ;; esac
+                    if [[ ! "$PKG" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+                      echo "WARNING: skipping '$PKG' in $PKG_FILE (not a package name)." >&2
+                      continue
+                    fi
+                    rpm -q "$PKG" > /dev/null 2>&1 || MISSING+=("$PKG")
+                  done < "$PKG_FILE"
+                  if [ "${#MISSING[@]}" -gt 0 ]; then
+                    echo "Installing from $PKG_FILE: ${MISSING[*]}"
+                    dnf install -y "${MISSING[@]}" || echo "WARNING: dnf install failed; the next run retries." >&2
+                  fi
 
                   # Point a path in ec2-user's home at the workspace. An existing real
                   # directory is moved in when the workspace has nothing there yet;
