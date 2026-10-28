@@ -906,7 +906,7 @@ All templates must pass cfn-lint with zero errors and warnings. CI
 pull request. To lint locally:
 
 ```bash
-cfn-lint cloud/dev/**/*.yaml ses/*.yaml redirect/*.yaml
+cfn-lint cloud/dev/**/*.yaml ses/*.yaml redirect/*.yaml static-site/*.yaml
 ```
 
 ## Domain redirect
@@ -945,6 +945,40 @@ aws cloudformation deploy \
 | `StatusCode` | `301` | `301` / `302` / `307` / `308`. Browsers cache 301/308, so use 302 while testing |
 | `PreservePath` | `false` | `true` appends the request path and query string (`/a?b=c` → `RedirectUrl/a?b=c`) |
 | `IncludeWww` | `false` | Also redirect `www.DomainName` |
+
+## Static website
+
+`static-site/static-site.yaml` hosts a static site from a private S3 bucket
+behind CloudFront (origin access control), served at `DomainName` and
+`www.DomainName`. It creates the bucket, a DNS-validated ACM certificate, the
+distribution, and A/AAAA alias records for both names in your hosted zone.
+Directory paths such as `/about/` resolve to `index.html`, and missing pages
+return `ErrorDocument` with a 404.
+
+```bash
+aws cloudformation deploy \
+  --region us-east-1 \
+  --template-file static-site/static-site.yaml \
+  --stack-name site-example-com \
+  --parameter-overrides \
+      DomainName=example.com \
+      HostedZoneId=<zone-id>
+
+aws s3 sync ./site s3://<BucketName output> --delete
+aws cloudfront create-invalidation --distribution-id <DistributionId output> --paths '/*'
+```
+
+- **Must be deployed in `us-east-1`**, because CloudFront only accepts ACM
+  certificates from there. A template rule enforces this.
+- The hosted zone must be in the same account and authoritative for the domain.
+- The domain and `www.` must not already have A/AAAA records.
+- The bucket is retained (and versioned) if the stack is deleted.
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `DomainName` | *(required)* | Site domain; `www.` is served too |
+| `HostedZoneId` | *(required)* | Route 53 zone for `DomainName` |
+| `ErrorDocument` | `404.html` | Object key shown for missing pages |
 
 ## GitHub Actions ephemeral Fargate runners
 
