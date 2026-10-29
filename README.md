@@ -973,6 +973,7 @@ aws cloudfront create-invalidation --distribution-id <DistributionId output> --p
 - The hosted zone must be in the same account and authoritative for the domain.
 - The domain and `www.` must not already have A/AAAA records.
 - The bucket is retained (and versioned) if the stack is deleted.
+- Incomplete multipart uploads are aborted automatically after 7 days.
 
 | Parameter | Default | Purpose |
 |---|---|---|

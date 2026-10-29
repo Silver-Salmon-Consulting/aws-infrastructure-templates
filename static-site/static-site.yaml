@@ -59,8 +59,13 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
-
-  SiteBucketPolicy:
+      # Failed or interrupted uploads leave parts that are billed until aborted.
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref SiteBucket
