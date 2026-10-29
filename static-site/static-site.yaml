@@ -24,8 +24,9 @@ Parameters:
     Type: String
     Default: static-site-bucket
     Description: >
-      Bucket names are BucketNamePrefix-StackName-AccountId (max 63 characters,
-      so keep the stack name short and lowercase). Must match the
+      Bucket names are BucketNamePrefix-DomainName-AccountId, with dots in the
+      domain replaced by dashes (max 63 characters, so the domain can be about
+      30 characters at most). Must match the
       BucketNamePrefix of static-site-permission-set.yaml, which grants access
       to buckets by this prefix.
     AllowedPattern: '^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$'
@@ -44,7 +45,9 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      BucketName: !Sub '${BucketNamePrefix}-${AWS::StackName}-${AWS::AccountId}'
+      BucketName: !Sub
+        - '${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
+        - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:

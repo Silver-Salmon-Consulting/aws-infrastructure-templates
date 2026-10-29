@@ -979,7 +979,7 @@ aws cloudfront create-invalidation --distribution-id <DistributionId output> --p
 | `DomainName` | *(required)* | Site domain; `www.` is served too |
 | `HostedZoneId` | *(required)* | Route 53 zone for `DomainName` |
 | `ErrorDocument` | `404.html` | Object key shown for missing pages |
-| `BucketNamePrefix` | `static-site-bucket` | Bucket is named `<prefix>-<stack name>-<account ID>` (max 63 characters, so use a short lowercase stack name). Must match the permission set's `BucketNamePrefix` |
+| `BucketNamePrefix` | `static-site-bucket` | Bucket is named `<prefix>-<domain with dots as dashes>-<account ID>` (max 63 characters, so the domain can be about 30 characters). Must match the permission set's `BucketNamePrefix` |
 
 ### Permission set for site editors
 
