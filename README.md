@@ -979,6 +979,29 @@ aws cloudfront create-invalidation --distribution-id <DistributionId output> --p
 | `DomainName` | *(required)* | Site domain; `www.` is served too |
 | `HostedZoneId` | *(required)* | Route 53 zone for `DomainName` |
 | `ErrorDocument` | `404.html` | Object key shown for missing pages |
+| `BucketNamePrefix` | `static-site-bucket` | Bucket is named `<prefix>-<stack name>-<account ID>` (max 63 characters, so use a short lowercase stack name). Must match the permission set's `BucketNamePrefix` |
+
+### Permission set for site editors
+
+`static-site/static-site-permission-set.yaml` creates an IAM Identity Center
+permission set that lets users upload to the site bucket(s), and nothing else in
+S3. Access is scoped by bucket name prefix (`BucketNamePrefix`, default
+`static-site-bucket`), which is why the site template names its bucket from the
+same prefix. Deploy it in the Identity Center account and assign it to the
+account hosting the site stack.
+
+```bash
+aws cloudformation deploy \
+  --template-file static-site/static-site-permission-set.yaml \
+  --stack-name StaticSitePermissionSet \
+  --parameter-overrides InstanceArn=<arn:aws:sso:::instance/ssoins-...>
+```
+
+It allows list, get, put and delete on objects (enough for
+`aws s3 sync --delete`) and CloudFront invalidations. The bucket is versioned
+and the permission set cannot delete object versions, so deletes only add
+delete markers. Changing `BucketNamePrefix` on an existing site stack replaces
+the bucket (the old one is retained).
 
 ## GitHub Actions ephemeral Fargate runners
 

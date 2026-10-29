@@ -20,6 +20,15 @@ Parameters:
     Type: String
     Default: 404.html
     Description: Object key shown for missing pages (served with a 404 status)
+  BucketNamePrefix:
+    Type: String
+    Default: static-site-bucket
+    Description: >
+      Bucket names are BucketNamePrefix-StackName-AccountId (max 63 characters,
+      so keep the stack name short and lowercase). Must match the
+      BucketNamePrefix of static-site-permission-set.yaml, which grants access
+      to buckets by this prefix.
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$'
 
 Rules:
   MustBeUsEast1:
@@ -35,6 +44,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${AWS::StackName}-${AWS::AccountId}'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
