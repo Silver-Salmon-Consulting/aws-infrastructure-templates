@@ -965,8 +965,19 @@ aws cloudformation deploy \
       HostedZoneId=<zone-id>
 
 aws s3 sync ./site s3://<BucketName output> --delete
-aws cloudfront create-invalidation --distribution-id <DistributionId output> --paths '/*'
 ```
+
+The template creates an IAM role, so pass `--capabilities CAPABILITY_IAM` to
+`deploy`.
+
+**Caching and invalidation.** Uploads need no metadata. CloudFront caches
+objects for `EdgeCacheSeconds` (default 1 day) and sends browsers
+`Cache-Control: public, max-age=BrowserCacheSeconds` (default 5 minutes). A
+`Cache-Control` set on an object overrides both. Every upload or delete queues
+an S3 event; a Lambda reads them in batches (about a minute) and issues a single
+`/*` invalidation, so a `sync` of many files costs one invalidation and the
+site updates within about a minute or two. Browsers keep what they cached for
+up to `BrowserCacheSeconds`.
 
 - **Must be deployed in `us-east-1`**, because CloudFront only accepts ACM
   certificates from there. A template rule enforces this.
@@ -980,6 +991,8 @@ aws cloudfront create-invalidation --distribution-id <DistributionId output> --p
 | `DomainName` | *(required)* | Site domain; `www.` is served too |
 | `HostedZoneId` | *(required)* | Route 53 zone for `DomainName` |
 | `ErrorDocument` | `404.html` | Object key shown for missing pages |
+| `EdgeCacheSeconds` | `86400` | CloudFront cache time for objects without `Cache-Control` |
+| `BrowserCacheSeconds` | `300` | Browser `max-age` for objects without `Cache-Control` |
 | `BucketNamePrefix` | `static-site-bucket` | Bucket is named `<prefix>-<domain with dots as dashes>-<account ID>` (max 63 characters, so the domain can be about 30 characters). Must match the permission set's `BucketNamePrefix` |
 
 ### Permission set for site editors
@@ -999,7 +1012,10 @@ aws cloudformation deploy \
 ```
 
 It allows list, get, put and delete on objects (enough for
-`aws s3 sync --delete`) and CloudFront invalidations. The bucket is versioned
+`aws s3 sync --delete`) and invoking the site's invalidation function for a
+manual flush (`aws lambda invoke --function-name
+static-site-bucket-invalidate-example-com out.json`), with no direct CloudFront
+access. The bucket is versioned
 and the permission set cannot delete object versions, so deletes only add
 delete markers. Changing `BucketNamePrefix` on an existing site stack replaces
 the bucket (the old one is retained).

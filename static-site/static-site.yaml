@@ -30,6 +30,23 @@ Parameters:
       BucketNamePrefix of static-site-permission-set.yaml, which grants access
       to buckets by this prefix.
     AllowedPattern: '^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$'
+  EdgeCacheSeconds:
+    Type: Number
+    Default: 86400
+    MinValue: 0
+    MaxValue: 31536000
+    Description: >
+      How long CloudFront caches objects that have no Cache-Control header. Safe
+      to keep long: every upload or delete invalidates the whole cache.
+  BrowserCacheSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 31536000
+    Description: >
+      max-age sent to browsers on objects that have no Cache-Control header.
+      Browsers can't be invalidated, so this is how long visitors may see
+      stale content after an upload.
 
 Rules:
   MustBeUsEast1:
@@ -44,6 +61,7 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
+    DependsOn: InvalidationQueuePolicy
     Properties:
       BucketName: !Sub
         - '${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
@@ -59,6 +77,13 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
+      # Any change queues a message; see the invalidation section below.
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt InvalidationQueue.Arn
+          - Event: 's3:ObjectRemoved:*'
+            Queue: !GetAtt InvalidationQueue.Arn
       # Failed or interrupted uploads leave parts that are billed until aborted.
       LifecycleConfiguration:
         Rules:
@@ -138,6 +163,141 @@ Resources:
             return request;
         }
 
+  # Objects are uploaded without metadata, so caching is decided here. Cache-
+  # Control set on an object (if you ever add it) still wins, because MinTTL is
+  # 0 and the response header below is not forced.
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-cache'
+        MinTTL: 0
+        DefaultTTL: !Ref EdgeCacheSeconds
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # Adds Cache-Control for browsers only when the object does not have one.
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-headers'
+        CustomHeadersConfig:
+          Items:
+            - Header: Cache-Control
+              Value: !Sub 'public, max-age=${BrowserCacheSeconds}'
+              Override: false
+
+  # ------------------------------------------------------------ Invalidation
+  # Uploads/deletes -> SQS -> Lambda -> one "/*" invalidation. SQS batches
+  # events for a minute, so `aws s3 sync` of many files causes a single
+  # invalidation. The bucket ARN is built from its name (not !Ref) to avoid a
+  # dependency cycle between the bucket, its notifications and this queue.
+  InvalidationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 86400
+      VisibilityTimeout: 180 # at least 6x the function timeout
+
+  InvalidationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref InvalidationQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBucketNotifications
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt InvalidationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub
+                  - 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
+                  - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  InvalidationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Logs plus receive/delete on SQS queues.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+      Policies:
+        - PolicyName: invalidate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  InvalidationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      # Fixed name so static-site-permission-set.yaml can allow invoking it.
+      FunctionName: !Sub
+        - '${BucketNamePrefix}-invalidate-${DomainDashed}'
+        - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
+      Description: !Sub 'Invalidate the ${DomainName} CloudFront cache after bucket changes'
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt InvalidationFunctionRole.Arn
+      Environment:
+        Variables:
+          DISTRIBUTION_ID: !Ref Distribution
+      Code:
+        ZipFile: |
+          import os
+          import time
+
+          import boto3
+
+          cloudfront = boto3.client("cloudfront")
+
+
+          def handler(event, context):
+              # One invalidation covers the whole batch of bucket events. A
+              # manual invoke has no records.
+              result = cloudfront.create_invalidation(
+                  DistributionId=os.environ["DISTRIBUTION_ID"],
+                  InvalidationBatch={
+                      "Paths": {"Quantity": 1, "Items": ["/*"]},
+                      "CallerReference": str(time.time()),
+                  },
+              )
+              print(
+                  "Invalidation %s for %d bucket events"
+                  % (result["Invalidation"]["Id"], len(event.get("Records", [])))
+              )
+
+  InvalidationEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt InvalidationQueue.Arn
+      FunctionName: !Ref InvalidationFunction
+      BatchSize: 10000
+      MaximumBatchingWindowInSeconds: 60
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -164,7 +324,8 @@ Resources:
           ViewerProtocolPolicy: redirect-to-https
           AllowedMethods: [GET, HEAD]
           Compress: true
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          CachePolicyId: !Ref CachePolicy
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt IndexFunction.FunctionMetadata.FunctionARN
@@ -226,7 +387,7 @@ Outputs:
     Description: Upload site files here (aws s3 sync ./site s3://<BucketName>)
     Value: !Ref SiteBucket
   DistributionId:
-    Description: Use for cache invalidations after uploading
+    Description: Cache is invalidated automatically after uploads; use for manual invalidations
     Value: !Ref Distribution
   DistributionDomainName:
     Value: !GetAtt Distribution.DomainName
