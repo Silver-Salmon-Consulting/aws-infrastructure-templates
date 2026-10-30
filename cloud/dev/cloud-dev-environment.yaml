@@ -1855,6 +1855,32 @@ Resources:
               InstanceIds:
                 - "{{InstanceId}}"
 
+  # Restarts the SSM agent on a dev server, for when Session Manager (and so
+  # SSH over SSM) stops connecting but the agent still takes Run Command. It
+  # is delivered BY the agent, so it cannot help when the agent is fully
+  # offline (TargetNotConnected): use RestartDevServerRunbook then. Run on
+  # demand, e.g. by cloud/dev/scripts/ssm-ssh-proxy.ps1 when a session fails.
+  RestartSsmAgentDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Restart the amazon-ssm-agent service a few seconds after this command
+          reports success.
+        mainSteps:
+          - action: aws:runShellScript
+            name: restartSsmAgent
+            inputs:
+              runCommand:
+                - set -euxo pipefail
+                # Restarting the agent inline would kill this command before it
+                # reports back. A transient systemd timer runs the restart in
+                # its own unit, outside the agent's cgroup, after we exit.
+                - systemd-run --on-active=5 --unit="restart-ssm-agent-$(date +%s)" systemctl restart amazon-ssm-agent
+
 
   # Tag-targeted SSM State Manager association that applies the Node config
   # document to every dev server tagged CloudDevNodeConfig=enabled. Lives in
@@ -2374,6 +2400,10 @@ Outputs:
   RestartDevServerRunbookName:
     Description: Name of the Automation runbook that reboots a dev server.
     Value: !Ref RestartDevServerRunbook
+
+  RestartSsmAgentDocumentName:
+    Description: Name of the Command document that restarts the SSM agent on a dev server.
+    Value: !Ref RestartSsmAgentDocument
   DevServerRoleArn:
     Description: ARN of the shared SSM-managed IAM role.
     Value: !GetAtt DevServerRole.Arn

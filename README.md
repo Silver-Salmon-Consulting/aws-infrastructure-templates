@@ -116,6 +116,35 @@ On Windows, wrap the `ProxyCommand` in PowerShell:
     ProxyCommand C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region <region> --profile <profile>"
 ```
 
+**Optional: start the server and restart a stuck SSM agent automatically.** On
+Windows, point `ProxyCommand` at
+[cloud/dev/scripts/ssm-ssh-proxy.ps1](cloud/dev/scripts/ssm-ssh-proxy.ps1)
+instead. It starts the server if it is stopped and waits for it. If the session
+fails to open, it runs the environment stack's `RestartSsmAgentDocumentName`
+document and tries once more:
+
+```
+    ProxyCommand powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\ssm-ssh-proxy.ps1 -InstanceId %h -Port %p -Region <region> -AwsProfile <profile> -RestartDocument <RestartSsmAgentDocumentName output>
+```
+
+For example, with the repo cloned to `C:\Projects\aws-infrastructure-templates`:
+
+```
+Host my-dev-server
+    HostName i-0123456789abcdef0
+    User ec2-user
+    IdentityFile ~/.ssh/my-key-pair.pem
+    ProxyCommand powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Projects\aws-infrastructure-templates\cloud\dev\scripts\ssm-ssh-proxy.ps1 -InstanceId %h -Port %p -Region us-west-2 -AwsProfile 123456789012_CloudDevDeveloper -RestartDocument CloudDev-RestartSsmAgentDocument-AbCdEf123456
+    StrictHostKeyChecking accept-new
+    ForwardAgent yes
+```
+
+Get the real document name from the environment stack's outputs:
+
+```bash
+aws cloudformation describe-stacks --stack-name <environment-stack> --query "Stacks[0].Outputs[?OutputKey=='RestartSsmAgentDocumentName'].OutputValue" --output text --region <region> --profile <profile>
+```
+
 ##### 5. Connect with VS Code
 
 Run **Remote-SSH: Connect to Host… → my-dev-server**, then open the folder
@@ -181,6 +210,7 @@ aws ssm start-session --target <instance-id> --region <region> --profile <profil
 | `TargetNotConnected` | The server is stopped (idle auto-stop). Start it, or wait a minute after a new deploy |
 | Tunnel test works but VS Code fails | VS Code still has the PATH from before the plugin was installed. Fully quit and restart it |
 | `Token has expired` | `aws sso login --profile <profile>` |
+| Server is running but sessions hang or fail | The SSM agent may be stuck. Run the `RestartSsmAgentDocumentName` document on it (Run Command). If the agent is offline (`TargetNotConnected` while the server is running), reboot it with `RestartDevServerRunbookName` instead |
 
 ### Architecture
 
@@ -191,11 +221,12 @@ aws ssm start-session --target <instance-id> --region <region> --profile <profil
     plus scoped inline policies that let the instances signal CloudFormation and
     write bootstrap logs;
   - a CloudWatch Logs group for instance bootstrap output;
-  - nine SSM Command Documents — one installs Node.js/npm via nvm, one
+  - ten SSM Command Documents — one installs Node.js/npm via nvm, one
     installs the system libraries/fonts and Chromium build Playwright needs
     (takes a `PlaywrightVersion`), one installs jq/zip/unzip, and the rest are
     per-version tool documents (PowerShell 7.4 and 7.6, .NET 8 and 10, k6 0.x
-    and 1.x, AWS CLI 2.x, GitHub CLI 2.x — see [Versioned tool documents](#versioned-tool-documents));
+    and 1.x, AWS CLI 2.x, GitHub CLI 2.x — see [Versioned tool documents](#versioned-tool-documents)),
+    plus an on-demand one that restarts the SSM agent;
   - **tag-targeted** SSM State Manager associations that apply those
     documents to any instance carrying the matching tag;
   - a workspace document and association that attach and mount each server's
