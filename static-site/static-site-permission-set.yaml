@@ -3,7 +3,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   IAM Identity Center permission set for static site editors. Grants managing
   objects in the static-site.yaml bucket(s) (matched by bucket name prefix) and
-  invalidating the CloudFront cache. Deploy in the Identity Center management
+  invoking their cache invalidation function. Deploy in the Identity Center management
   (or delegated administrator) account, then assign the permission set to the
   account(s) that host the static site stack.
 
@@ -65,7 +65,7 @@ Resources:
     Properties:
       InstanceArn: !Ref InstanceArn
       Name: !Ref PermissionSetName
-      Description: !Sub "Upload to ${BucketNamePrefix}-* buckets and invalidate CloudFront."
+      Description: !Sub "Upload to ${BucketNamePrefix}-* buckets and run the cache invalidation function."
       SessionDuration: !Ref SessionDuration
       InlinePolicy:
         Version: "2012-10-17"
@@ -96,18 +96,21 @@ Resources:
               - s3:AbortMultipartUpload
             Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketNamePrefix}-*/*"
 
-          # Distribution IDs are generated, so this cannot be narrowed further.
-          - Sid: InvalidateCache
+          # Manual cache invalidation: invoke the site stack's invalidation
+          # function (named <prefix>-invalidate-<domain>), which has the
+          # CloudFront permission itself. Users get no direct CloudFront access.
+          - Sid: InvokeInvalidationFunction
             Effect: Allow
             Action:
-              - cloudfront:CreateInvalidation
-              - cloudfront:GetInvalidation
-              - cloudfront:ListInvalidations
-            Resource: !Sub "arn:${AWS::Partition}:cloudfront::*:distribution/*"
+              - lambda:InvokeFunction
+              - lambda:GetFunction
+            Resource: !Sub "arn:${AWS::Partition}:lambda:*:*:function:${BucketNamePrefix}-invalidate-*"
 
-          - Sid: FindDistributions
+          # Lets the Lambda console list functions; ListFunctions does not
+          # support resource-level permissions, so other function names show.
+          - Sid: ListFunctions
             Effect: Allow
-            Action: cloudfront:ListDistributions
+            Action: lambda:ListFunctions
             Resource: "*"
 
 Outputs:
