@@ -64,9 +64,13 @@ Conditions:
 Rules:
   DomainNeedsZone:
     Assertions:
-      - Assert: !Equals
-          - !Equals [!Ref DomainName, '']
-          - !Equals [!Ref HostedZoneId, '']
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref DomainName, '']
+            - !Equals [!Ref HostedZoneId, '']
+          - !And
+            - !Not [!Equals [!Ref DomainName, '']]
+            - !Not [!Equals [!Ref HostedZoneId, '']]
         AssertDescription: Set both DomainName and HostedZoneId, or neither.
   MustBeUsEast1:
     Assertions:

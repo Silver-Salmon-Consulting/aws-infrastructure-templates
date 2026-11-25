@@ -937,7 +937,9 @@ All templates must pass cfn-lint with zero errors and warnings. CI
 pull request. To lint locally:
 
 ```bash
-cfn-lint cloud/dev/**/*.yaml ses/*.yaml redirect/*.yaml static-site/*.yaml
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+scripts/lint.sh
 ```
 
 ## Domain redirect

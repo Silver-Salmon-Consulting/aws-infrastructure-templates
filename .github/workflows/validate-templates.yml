@@ -21,32 +21,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install cfn-lint
-        run: pip install cfn-lint
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
 
       - name: Lint CloudFormation templates
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Collect every YAML file that looks like a CloudFormation template
-          # (has the AWSTemplateFormatVersion or a Resources section).
-          mapfile -t templates < <(grep -rlE '^(AWSTemplateFormatVersion|Resources):' \
-            --include='*.yaml' --include='*.yml' . || true)
-
-          if [ ${#templates[@]} -eq 0 ]; then
-            echo "No CloudFormation templates found."
-            exit 0
-          fi
-
-          echo "Linting the following templates:"
-          printf '  %s\n' "${templates[@]}"
-          cfn-lint "${templates[@]}"
+        run: scripts/lint.sh
 
       - name: Check the embedded rotate-git-key matches the repo script
         shell: bash
         run: |
           set -euo pipefail
-          pip install pyyaml
           python - <<'PY'
           import sys, yaml
 
