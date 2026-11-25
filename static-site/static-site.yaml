@@ -1,21 +1,30 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Simple static website: a private S3 bucket served through CloudFront (origin
-  access control) at DomainName and www.DomainName, with a DNS-validated ACM
-  certificate and A/AAAA alias records in an existing Route 53 hosted zone.
-  Upload site files to the bucket (see the BucketName output). Must be deployed
-  in us-east-1 (CloudFront only accepts ACM certificates from there).
+  access control). With DomainName and HostedZoneId it is served at DomainName
+  and www.DomainName, with a DNS-validated ACM certificate and A/AAAA alias
+  records in an existing Route 53 hosted zone. Leave both empty to use the
+  default CloudFront URL (https://xxxx.cloudfront.net) instead. Upload site
+  files to the bucket (see the BucketName output). Must be deployed in
+  us-east-1.
 
 Parameters:
   DomainName:
     Type: String
-    Description: Site domain (e.g. example.com). www.DomainName is served too.
-    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
-  HostedZoneId:
-    Type: AWS::Route53::HostedZone::Id
+    Default: ''
     Description: >
-      Route 53 hosted zone ID for DomainName, in this account. Used for ACM DNS
-      validation and the alias records pointing at CloudFront.
+      Site domain (e.g. example.com); www.DomainName is served too. Leave empty
+      to use the default CloudFront URL (then HostedZoneId must be empty too,
+      and resource names use part of the stack ID instead of the domain).
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 hosted zone ID for DomainName, in this account (required when
+      DomainName is set). Used for ACM DNS validation and the alias records
+      pointing at CloudFront.
+    AllowedPattern: '^$|^Z[A-Z0-9]+$'
   ErrorDocument:
     Type: String
     Default: 404.html
@@ -26,7 +35,8 @@ Parameters:
     Description: >
       Bucket names are BucketNamePrefix-DomainName-AccountId, with dots in the
       domain replaced by dashes (max 63 characters, so the domain can be about
-      30 characters at most). Must match the
+      30 characters at most). Without a domain, an 8-character ID taken from
+      the stack ID replaces the domain. Must match the
       BucketNamePrefix of static-site-permission-set.yaml, which grants access
       to buckets by this prefix.
     AllowedPattern: '^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$'
@@ -48,7 +58,16 @@ Parameters:
       Browsers can't be invalidated, so this is how long visitors may see
       stale content after an upload.
 
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+
 Rules:
+  DomainNeedsZone:
+    Assertions:
+      - Assert: !Equals
+          - !Equals [!Ref DomainName, '']
+          - !Equals [!Ref HostedZoneId, '']
+        AssertDescription: Set both DomainName and HostedZoneId, or neither.
   MustBeUsEast1:
     Assertions:
       - Assert: !Equals [!Ref AWS::Region, us-east-1]
@@ -65,7 +84,7 @@ Resources:
     Properties:
       BucketName: !Sub
         - '${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
-        - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
+        - DomainDashed: !If [HasDomain, !Join ['-', !Split ['.', !Ref DomainName]], !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -122,6 +141,7 @@ Resources:
   # ------------------------------------------------------------- Certificate
   # DNS validation records are created in HostedZoneId automatically.
   Certificate:
+    Condition: HasDomain
     Type: AWS::CertificateManager::Certificate
     Properties:
       DomainName: !Ref DomainName
@@ -151,7 +171,7 @@ Resources:
       Name: !Sub '${AWS::StackName}-index'
       AutoPublish: true
       FunctionConfig:
-        Comment: !Sub 'Directory index rewrite for ${DomainName}'
+        Comment: !Sub 'Directory index rewrite for ${AWS::StackName}'
         Runtime: cloudfront-js-2.0
       FunctionCode: |
         function handler(event) {
@@ -226,7 +246,7 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !Sub
                   - 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
-                  - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
+                  - DomainDashed: !If [HasDomain, !Join ['-', !Split ['.', !Ref DomainName]], !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
@@ -258,8 +278,8 @@ Resources:
       # Fixed name so static-site-permission-set.yaml can allow invoking it.
       FunctionName: !Sub
         - '${BucketNamePrefix}-invalidate-${DomainDashed}'
-        - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
-      Description: !Sub 'Invalidate the ${DomainName} CloudFront cache after bucket changes'
+        - DomainDashed: !If [HasDomain, !Join ['-', !Split ['.', !Ref DomainName]], !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]
+      Description: !Sub 'Invalidate the ${AWS::StackName} CloudFront cache after bucket changes'
       Runtime: python3.13
       Handler: index.handler
       Timeout: 30
@@ -304,17 +324,22 @@ Resources:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
-        Comment: !Sub 'Static site ${DomainName}'
+        Comment: !If [HasDomain, !Sub 'Static site ${DomainName}', !Sub 'Static site ${AWS::StackName}']
         Enabled: true
         HttpVersion: http2and3
         IPV6Enabled: true
         PriceClass: PriceClass_100
         DefaultRootObject: index.html
-        Aliases: [!Ref DomainName, !Sub 'www.${DomainName}']
-        ViewerCertificate:
-          AcmCertificateArn: !Ref Certificate
-          SslSupportMethod: sni-only
-          MinimumProtocolVersion: TLSv1.2_2021
+        Aliases: !If
+          - HasDomain
+          - [!Ref DomainName, !Sub 'www.${DomainName}']
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref Certificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
         Origins:
           - Id: site-bucket
             DomainName: !GetAtt SiteBucket.RegionalDomainName
@@ -345,6 +370,7 @@ Resources:
   # --------------------------------------------------------------------- DNS
   # Z2FDTNDATAQYW2 is the fixed hosted zone ID for all CloudFront aliases.
   ApexRecordA:
+    Condition: HasDomain
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
@@ -355,6 +381,7 @@ Resources:
         HostedZoneId: Z2FDTNDATAQYW2
 
   ApexRecordAAAA:
+    Condition: HasDomain
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
@@ -365,6 +392,7 @@ Resources:
         HostedZoneId: Z2FDTNDATAQYW2
 
   WwwRecordA:
+    Condition: HasDomain
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
@@ -375,6 +403,7 @@ Resources:
         HostedZoneId: Z2FDTNDATAQYW2
 
   WwwRecordAAAA:
+    Condition: HasDomain
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
@@ -394,6 +423,10 @@ Outputs:
   DistributionDomainName:
     Value: !GetAtt Distribution.DomainName
   CertificateArn:
+    Condition: HasDomain
     Value: !Ref Certificate
   SiteUrl:
-    Value: !Sub 'https://${DomainName}'
+    Value: !If
+      - HasDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${Distribution.DomainName}'
