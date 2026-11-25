@@ -1,29 +1,29 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Simple static website: a private S3 bucket served through CloudFront (origin
-  access control). With DomainName and HostedZoneId it is served at DomainName
+  access control). With HostedZoneId it is served at DomainName
   and www.DomainName, with a DNS-validated ACM certificate and A/AAAA alias
-  records in an existing Route 53 hosted zone. Leave both empty to use the
-  default CloudFront URL (https://xxxx.cloudfront.net) instead. Upload site
+  records in an existing Route 53 hosted zone. Leave HostedZoneId empty to use
+  the default CloudFront URL (https://xxxx.cloudfront.net) instead. Upload site
   files to the bucket (see the BucketName output). Must be deployed in
   us-east-1.
 
 Parameters:
   DomainName:
     Type: String
-    Default: ''
     Description: >
-      Site domain (e.g. example.com); www.DomainName is served too. Leave empty
-      to use the default CloudFront URL (then HostedZoneId must be empty too,
-      and resource names use the stack name instead of the domain).
-    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+      Site domain (e.g. example.com); www.DomainName is served too. Used with
+      HostedZoneId. If HostedZoneId is empty, this is just a name for the site
+      (e.g. my-site) used in resource names, and the site is served at the
+      default CloudFront URL instead. Lowercase only.
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$'
   HostedZoneId:
     Type: String
     Default: ''
     Description: >
-      Route 53 hosted zone ID for DomainName, in this account (required when
-      DomainName is set). Used for ACM DNS validation and the alias records
-      pointing at CloudFront.
+      Route 53 hosted zone ID for DomainName, in this account. Set it to serve
+      the site at DomainName (used for ACM DNS validation and the alias records
+      pointing at CloudFront). Leave empty to use the default CloudFront URL.
     AllowedPattern: '^$|^Z[A-Z0-9]+$'
   ErrorDocument:
     Type: String
@@ -35,8 +35,8 @@ Parameters:
     Description: >
       Bucket names are BucketNamePrefix-DomainName-AccountId, with dots in the
       domain replaced by dashes (max 63 characters, so the domain can be about
-      30 characters at most). Without a domain, the stack name replaces the
-      domain (so it must be lowercase, or the bucket fails to create). Must match the
+      30 characters at most). The name is used the same
+      way when HostedZoneId is empty. Must match the
       BucketNamePrefix of static-site-permission-set.yaml, which grants access
       to buckets by this prefix.
     AllowedPattern: '^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$'
@@ -59,19 +59,9 @@ Parameters:
       stale content after an upload.
 
 Conditions:
-  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasDomain: !Not [!Equals [!Ref HostedZoneId, '']]
 
 Rules:
-  DomainNeedsZone:
-    Assertions:
-      - Assert: !Or
-          - !And
-            - !Equals [!Ref DomainName, '']
-            - !Equals [!Ref HostedZoneId, '']
-          - !And
-            - !Not [!Equals [!Ref DomainName, '']]
-            - !Not [!Equals [!Ref HostedZoneId, '']]
-        AssertDescription: Set both DomainName and HostedZoneId, or neither.
   MustBeUsEast1:
     Assertions:
       - Assert: !Equals [!Ref AWS::Region, us-east-1]
@@ -88,7 +78,7 @@ Resources:
     Properties:
       BucketName: !Sub
         - '${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
-        - DomainDashed: !If [HasDomain, !Join ['-', !Split ['.', !Ref DomainName]], !Ref AWS::StackName]
+        - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -250,7 +240,7 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !Sub
                   - 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${DomainDashed}-${AWS::AccountId}'
-                  - DomainDashed: !If [HasDomain, !Join ['-', !Split ['.', !Ref DomainName]], !Ref AWS::StackName]
+                  - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
@@ -282,7 +272,7 @@ Resources:
       # Fixed name so static-site-permission-set.yaml can allow invoking it.
       FunctionName: !Sub
         - '${BucketNamePrefix}-invalidate-${DomainDashed}'
-        - DomainDashed: !If [HasDomain, !Join ['-', !Split ['.', !Ref DomainName]], !Ref AWS::StackName]
+        - DomainDashed: !Join ['-', !Split ['.', !Ref DomainName]]
       Description: !Sub 'Invalidate the ${AWS::StackName} CloudFront cache after bucket changes'
       Runtime: python3.13
       Handler: index.handler

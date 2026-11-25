@@ -97,7 +97,7 @@ Resources:
             Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketNamePrefix}-*/*"
 
           # Manual cache invalidation: invoke the site stack's invalidation
-          # function (named <prefix>-invalidate-<domain or stack name>), which has the
+          # function (named <prefix>-invalidate-<domain or name>), which has the
           # CloudFront permission itself. Users get no direct CloudFront access.
           - Sid: InvokeInvalidationFunction
             Effect: Allow
