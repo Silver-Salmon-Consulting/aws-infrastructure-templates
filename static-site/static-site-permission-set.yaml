@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  IAM Identity Center permission set for static site editors. Grants managing
+  objects in the static-site.yaml bucket(s) (matched by bucket name prefix) and
+  invalidating the CloudFront cache. Deploy in the Identity Center management
+  (or delegated administrator) account, then assign the permission set to the
+  account(s) that host the static site stack.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: IAM Identity Center
+        Parameters:
+          - InstanceArn
+          - PermissionSetName
+          - SessionDuration
+      - Label:
+          default: Static site
+        Parameters:
+          - BucketNamePrefix
+
+Parameters:
+  InstanceArn:
+    Type: String
+    Description: >-
+      ARN of the IAM Identity Center instance
+      (`aws sso-admin list-instances`), e.g.
+      arn:aws:sso:::instance/ssoins-1234567890abcdef.
+    AllowedPattern: ^arn:aws[a-z-]*:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$
+    ConstraintDescription: Must be an Identity Center instance ARN.
+
+  PermissionSetName:
+    Type: String
+    Description: Name shown in the AWS access portal (max 32 characters).
+    Default: StaticSiteEditor
+    AllowedPattern: ^[\w+=,.@-]{1,32}$
+    ConstraintDescription: 1-32 characters from [A-Za-z0-9_+=,.@-].
+
+  SessionDuration:
+    Type: String
+    Description: How long an access-portal session lasts (ISO 8601 duration).
+    Default: PT8H
+    AllowedValues:
+      - PT1H
+      - PT4H
+      - PT8H
+      - PT12H
+
+  BucketNamePrefix:
+    Type: String
+    Description: >-
+      Bucket name prefix used by static-site.yaml (its BucketNamePrefix
+      parameter). Access is granted to buckets named <prefix>-*.
+    Default: static-site-bucket
+    AllowedPattern: ^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$
+
+Resources:
+  # Permission sets are global, so resources below use wildcard accounts; the
+  # bucket name prefix does the scoping. Assign the set only to the account(s)
+  # hosting the site stack.
+  StaticSitePermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref InstanceArn
+      Name: !Ref PermissionSetName
+      Description: !Sub "Upload to ${BucketNamePrefix}-* buckets and invalidate CloudFront."
+      SessionDuration: !Ref SessionDuration
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Lets the S3 console list buckets; names of other buckets are visible
+          # but not accessible. ListAllMyBuckets has no resource-level support.
+          - Sid: ListBuckets
+            Effect: Allow
+            Action: s3:ListAllMyBuckets
+            Resource: "*"
+
+          - Sid: ListSiteBuckets
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:ListBucketMultipartUploads
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketNamePrefix}-*"
+
+          # Enough for `aws s3 sync --delete`. No *Version actions: the bucket is
+          # versioned, so deletes only add delete markers and history is kept.
+          - Sid: ManageSiteObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketNamePrefix}-*/*"
+
+          # Distribution IDs are generated, so this cannot be narrowed further.
+          - Sid: InvalidateCache
+            Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+              - cloudfront:GetInvalidation
+              - cloudfront:ListInvalidations
+            Resource: !Sub "arn:${AWS::Partition}:cloudfront::*:distribution/*"
+
+          - Sid: FindDistributions
+            Effect: Allow
+            Action: cloudfront:ListDistributions
+            Resource: "*"
+
+Outputs:
+  PermissionSetArn:
+    Description: >-
+      ARN of the permission set. Assign it to users or groups for the
+      account(s) hosting the static site stack.
+    Value: !GetAtt StaticSitePermissionSet.PermissionSetArn
