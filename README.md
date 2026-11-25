@@ -1021,7 +1021,7 @@ up to `BrowserCacheSeconds`.
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `DomainName` | *(empty)* | Site domain; `www.` is served too. Leave empty (with `HostedZoneId`) to use the default `*.cloudfront.net` URL; names then use part of the stack ID |
+| `DomainName` | *(empty)* | Site domain; `www.` is served too. Leave empty (with `HostedZoneId`) to use the default `*.cloudfront.net` URL; names then use the stack name, which must be lowercase |
 | `HostedZoneId` | *(empty)* | Route 53 zone for `DomainName`; required with it, must be empty without |
 | `ErrorDocument` | `404.html` | Object key shown for missing pages |
 | `EdgeCacheSeconds` | `86400` | CloudFront cache time for objects without `Cache-Control` |
