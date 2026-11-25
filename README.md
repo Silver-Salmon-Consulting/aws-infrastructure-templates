@@ -937,7 +937,9 @@ All templates must pass cfn-lint with zero errors and warnings. CI
 pull request. To lint locally:
 
 ```bash
-cfn-lint cloud/dev/**/*.yaml ses/*.yaml redirect/*.yaml static-site/*.yaml
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+scripts/lint.sh
 ```
 
 ## Domain redirect
@@ -996,20 +998,60 @@ aws cloudformation deploy \
       HostedZoneId=<zone-id>
 
 aws s3 sync ./site s3://<BucketName output> --delete
-aws cloudfront create-invalidation --distribution-id <DistributionId output> --paths '/*'
 ```
+
+The template creates an IAM role, so pass `--capabilities CAPABILITY_IAM` to
+`deploy`.
+
+**Caching and invalidation.** Uploads need no metadata. CloudFront caches
+objects for `EdgeCacheSeconds` (default 1 day) and sends browsers
+`Cache-Control: public, max-age=BrowserCacheSeconds` (default 5 minutes). A
+`Cache-Control` set on an object overrides both. Every upload or delete queues
+an S3 event; a Lambda reads them in batches (about a minute) and issues a single
+`/*` invalidation, so a `sync` of many files costs one invalidation and the
+site updates within about a minute or two. Browsers keep what they cached for
+up to `BrowserCacheSeconds`.
 
 - **Must be deployed in `us-east-1`**, because CloudFront only accepts ACM
   certificates from there. A template rule enforces this.
 - The hosted zone must be in the same account and authoritative for the domain.
 - The domain and `www.` must not already have A/AAAA records.
 - The bucket is retained (and versioned) if the stack is deleted.
+- Incomplete multipart uploads are aborted automatically after 7 days.
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `DomainName` | *(required)* | Site domain; `www.` is served too |
-| `HostedZoneId` | *(required)* | Route 53 zone for `DomainName` |
+| `DomainName` | *(required)* | Site domain (`www.` is served too). Without `HostedZoneId` it is only a lowercase name used in resource names |
+| `HostedZoneId` | *(empty)* | Route 53 zone for `DomainName`. Leave empty to use the default `*.cloudfront.net` URL |
 | `ErrorDocument` | `404.html` | Object key shown for missing pages |
+| `EdgeCacheSeconds` | `86400` | CloudFront cache time for objects without `Cache-Control` |
+| `BrowserCacheSeconds` | `300` | Browser `max-age` for objects without `Cache-Control` |
+| `BucketNamePrefix` | `static-site-bucket` | Bucket is named `<prefix>-<domain with dots as dashes>-<account ID>` (max 63 characters, so the domain can be about 30 characters). Must match the permission set's `BucketNamePrefix` |
+
+### Permission set for site editors
+
+`static-site/static-site-permission-set.yaml` creates an IAM Identity Center
+permission set that lets users upload to the site bucket(s), and nothing else in
+S3. Access is scoped by bucket name prefix (`BucketNamePrefix`, default
+`static-site-bucket`), which is why the site template names its bucket from the
+same prefix. Deploy it in the Identity Center account and assign it to the
+account hosting the site stack.
+
+```bash
+aws cloudformation deploy \
+  --template-file static-site/static-site-permission-set.yaml \
+  --stack-name StaticSitePermissionSet \
+  --parameter-overrides InstanceArn=<arn:aws:sso:::instance/ssoins-...>
+```
+
+It allows list, get, put and delete on objects (enough for
+`aws s3 sync --delete`) and invoking the site's invalidation function for a
+manual flush (`aws lambda invoke --function-name
+static-site-bucket-invalidate-example-com out.json`), with no direct CloudFront
+access. The bucket is versioned
+and the permission set cannot delete object versions, so deletes only add
+delete markers. Changing `BucketNamePrefix` on an existing site stack replaces
+the bucket (the old one is retained).
 
 ## GitHub Actions ephemeral Fargate runners
 

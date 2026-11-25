@@ -47,7 +47,7 @@ jobs:
       - name: Lint the updated template
         if: steps.update.outputs.changed == 'true'
         run: |
-          pip install cfn-lint
+          pip install -r requirements-dev.txt
           cfn-lint cloud/dev/cloud-dev-environment.yaml
 
       - name: Open pull request
